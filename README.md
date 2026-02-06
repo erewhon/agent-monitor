@@ -82,11 +82,28 @@ bind-key F12 run-shell "focus-agent-monitor"
 
 Then from any inner tmux session, press `C-b M-m` or `C-b F12` to return focus to the agent-monitor pane.
 
+## Agent Groups
+
+Organize agents into named groups by creating `~/.config/agent-monitor/groups.yaml`:
+
+```yaml
+groups:
+  - name: Astronomy
+    sessions: [astra, esc, erewhot, randomerewhon]
+  - name: Web
+    sessions: [webapp, frontend]
+```
+
+- Groups are displayed in config order with colored headers
+- Agents not matching any group appear in an "Other" section at the bottom
+- If the config file is missing or malformed, agents display in a flat alphabetical list
+- Groups cycle through purple/violet header colors; "Other" uses a dimmer blue-gray
+
 ## Status Indicators
 
 | Symbol | Status | Description |
 |--------|--------|-------------|
-| `●` (green) | Running | Agent is actively working |
+| `⠋` (green, animated) | Running | Agent is actively working (animated Braille spinner) |
 | `◐` (yellow) | Waiting | Agent needs user input (permission prompt) |
 | `○` (gray) | Idle | Agent is ready for a new command |
 | `✕` (red) | Error | Agent encountered an error |
@@ -116,6 +133,7 @@ agent-monitor --no-attach
 | `agent-monitor-session` | `~/.local/bin/` | Launcher script |
 | `focus-agent-monitor` | `~/.local/bin/` | Helper to return focus |
 | `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config |
+| `groups.yaml` | `~/.config/agent-monitor/` | Agent grouping config (optional) |
 
 ## Requirements
 
