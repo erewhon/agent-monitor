@@ -1,0 +1,64 @@
+version: 2
+
+builds:
+  - id: agent-monitor
+    main: .
+    binary: agent-monitor
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - id: agent-monitor
+    formats: [tar.gz]
+    name_template: "agent-monitor_{{ .Os }}_{{ .Arch }}"
+    files:
+      - agent-monitor-session
+      - focus-agent-monitor
+      - agent-monitor-placeholder
+      - tmux-outer.conf
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+brews:
+  - name: agent-monitor
+    repository:
+      owner: erewhon
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/erewhon/agent-monitor"
+    description: "TUI for tracking Claude Code agents in tmux sessions"
+    license: "MIT"
+    install: |
+      bin.install "agent-monitor"
+      bin.install "agent-monitor-session"
+      bin.install "focus-agent-monitor"
+      bin.install "agent-monitor-placeholder"
+      etc.install "tmux-outer.conf" => "agent-monitor/tmux-outer.conf"
+    caveats: |
+      The tmux config has been installed to:
+        #{etc}/agent-monitor/tmux-outer.conf
+
+      To use the session launcher, you may want to update the config path
+      in agent-monitor-session or copy it to ~/.config/agent-monitor-tmux.conf
+    test: |
+      assert_match "agent-monitor", shell_output("#{bin}/agent-monitor --help 2>&1", 1)
