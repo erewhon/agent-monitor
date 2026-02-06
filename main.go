@@ -124,6 +124,15 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // Planning frames — pulsing diamond (slower cycle via frame division)
 var planningFrames = []string{"◇", "◇", "◈", "◆", "◆", "◈"}
 
+// Waiting frames — pulsing half-circle
+var waitingFrames = []string{"◐", "◐", "◑", "◑"}
+
+// Gradient colors for the title — subtle purple range
+var titleGradient = []lipgloss.Color{
+	"#9933ff", "#a64dff", "#b366ff", "#bf80ff",
+	"#cc99ff", "#bf80ff", "#b366ff", "#a64dff",
+}
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents       []Agent
@@ -151,12 +160,6 @@ type attachResultMsg struct {
 
 // Styles
 var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#cc66ff")).
-			Background(lipgloss.Color("#1a0033")).
-			Padding(0, 1)
-
 	selectedStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("212")).
@@ -275,10 +278,10 @@ func spinnerTickCmd() tea.Cmd {
 	})
 }
 
-// hasAnimatedAgents checks if any agent needs animation (running or planning).
+// hasAnimatedAgents checks if any agent needs animation (running, planning, or waiting).
 func (m Model) hasAnimatedAgents() bool {
 	for _, a := range m.agents {
-		if a.Status == StatusRunning || a.Status == StatusPlanning {
+		if a.Status == StatusRunning || a.Status == StatusPlanning || a.Status == StatusWaiting {
 			return true
 		}
 	}
@@ -397,6 +400,9 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 		lastLine = lastLines[len(lastLines)-1]
 	}
 
+	// Find a meaningful activity line (not a prompt, separator, or UI chrome)
+	activityLine := findActivityLine(lastLines)
+
 	recentContent := strings.Join(lastLines, "\n")
 
 	// --- Active work detection ---
@@ -408,28 +414,28 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 	// Match any line with "…" followed by a parenthesized duration.
 	activeSpinner := regexp.MustCompile(`(?m)…\s+\(\d+[ms]`)
 	if activeSpinner.MatchString(recentContent) {
-		return StatusRunning, truncate(lastLine, 50)
+		return StatusRunning, truncate(activityLine, 60)
 	}
 
 	// Also match spinner lines by prefix char + text + … (without timing, for early display)
 	activeSpinnerAlt := regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+.+…`)
 	if activeSpinnerAlt.MatchString(recentContent) {
-		return StatusRunning, truncate(lastLine, 50)
+		return StatusRunning, truncate(activityLine, 60)
 	}
 
 	// Tool execution: ⎿ at line start followed by Running
 	if regexp.MustCompile(`(?m)^⎿\s+Running`).MatchString(recentContent) {
-		return StatusRunning, truncate(lastLine, 50)
+		return StatusRunning, truncate(activityLine, 60)
 	}
 
 	// Subagent execution: "Running N ... agents…" at line start
 	if regexp.MustCompile(`(?m)^●\s+Running\s+\d+`).MatchString(recentContent) {
-		return StatusRunning, truncate(lastLine, 50)
+		return StatusRunning, truncate(activityLine, 60)
 	}
 
 	// Streaming indicators at line start (e.g. "* Thinking…" shown during generation)
 	if regexp.MustCompile(`(?m)^\*\s+(Thinking|Waiting)…`).MatchString(recentContent) {
-		return StatusRunning, truncate(lastLine, 50)
+		return StatusRunning, truncate(activityLine, 60)
 	}
 
 	// --- UI states (checked on wider recent content) ---
@@ -449,21 +455,53 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 	}
 	for _, pattern := range permissionPatterns {
 		if strings.Contains(recentContent, pattern) {
-			return StatusWaiting, truncate(lastLine, 50)
+			return StatusWaiting, truncate(activityLine, 60)
 		}
 	}
 
 	// Plan mode: agent is exploring/designing
 	if strings.Contains(recentContent, "plan mode") {
-		return StatusPlanning, truncate(lastLine, 50)
+		return StatusPlanning, truncate(activityLine, 60)
 	}
 
 	// Idle at prompt: ready for new command input
 	if strings.Contains(lastLine, "⏵⏵") || strings.Contains(lastLine, "accept edits") {
-		return StatusIdle, truncate(lastLine, 50)
+		return StatusIdle, truncate(activityLine, 60)
 	}
 
-	return StatusIdle, truncate(lastLine, 50)
+	return StatusIdle, truncate(activityLine, 60)
+}
+
+// findActivityLine scans recent lines bottom-up for a meaningful content line,
+// skipping prompts, separators, and UI chrome.
+func findActivityLine(lines []string) string {
+	skipPatterns := []string{
+		"⏵⏵",
+		"────",
+		"❯",
+		"erewhon@",
+		"Esc to cancel",
+		"Tab to amend",
+		"Do you want",
+		"accept edits",
+		"plan mode",
+		"Context left",
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
+		skip := false
+		for _, pat := range skipPatterns {
+			if strings.Contains(line, pat) {
+				skip = true
+				break
+			}
+		}
+		// Skip lines that are just numbers/diff markers
+		if !skip && len(line) > 2 {
+			return line
+		}
+	}
+	return ""
 }
 
 func truncate(s string, maxLen int) string {
@@ -625,7 +663,8 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 		frame := planningFrames[m.spinnerFrame%len(planningFrames)]
 		return statusPlanning.Render(frame)
 	case StatusWaiting:
-		return statusWaiting.Render(agent.Status.Symbol())
+		frame := waitingFrames[m.spinnerFrame%len(waitingFrames)]
+		return statusWaiting.Render(frame)
 	case StatusIdle:
 		return statusIdle.Render(agent.Status.Symbol())
 	case StatusError:
@@ -635,8 +674,8 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 	}
 }
 
-// renderAgentLine renders a single agent line with status symbol and name.
-func (m Model) renderAgentLine(agent Agent, idx int) string {
+// renderAgentLine renders a single agent line with status symbol, name, and last activity.
+func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
 	symbol := m.renderStatusSymbol(agent)
 
 	name := agent.Name
@@ -644,7 +683,18 @@ func (m Model) renderAgentLine(agent Agent, idx int) string {
 		name = attachedStyle.Render(name + " ◀")
 	}
 
-	line := fmt.Sprintf("%s %s", symbol, name)
+	line := fmt.Sprintf("%s %-*s", symbol, maxNameLen, name)
+
+	// Show truncated last activity in dim text
+	if agent.LastLine != "" {
+		activity := agent.LastLine
+		// Trim available width: 2 (indent) + 2 (symbol+space) + maxNameLen + 2 (gap)
+		maxActivity := m.width - 8 - maxNameLen
+		if maxActivity > 6 {
+			activity = truncate(activity, maxActivity)
+			line += "  " + dimStyle.Render(activity)
+		}
+	}
 
 	if idx == m.cursor {
 		return selectedStyle.Render("> " + line)
@@ -652,17 +702,103 @@ func (m Model) renderAgentLine(agent Agent, idx int) string {
 	return normalStyle.Render("  " + line)
 }
 
+// renderGradientTitle renders the title with a subtle shimmer effect.
+// The gradient is mostly static with a slow-moving highlight.
+func (m Model) renderGradientTitle(text string) string {
+	var b strings.Builder
+	runes := []rune(text)
+	// Shimmer moves one position every 4 animation frames
+	shimmerPos := (m.spinnerFrame / 4) % len(runes)
+	for i, r := range runes {
+		colorIdx := i % len(titleGradient)
+		color := titleGradient[colorIdx]
+		// Brighten the character near the shimmer position
+		dist := i - shimmerPos
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist <= 1 {
+			color = "#e0b3ff" // bright highlight
+		} else if dist == 2 {
+			color = "#cc99ff" // softer highlight
+		}
+		style := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color(color)).
+			Background(lipgloss.Color("#1a0033"))
+		b.WriteString(style.Render(string(r)))
+	}
+	return b.String()
+}
+
+// renderStatusSummary renders a colored status summary line.
+func (m Model) renderStatusSummary() string {
+	var running, planning, waiting, idle, errCount int
+	for _, a := range m.flatAgents {
+		switch a.Status {
+		case StatusRunning:
+			running++
+		case StatusPlanning:
+			planning++
+		case StatusWaiting:
+			waiting++
+		case StatusIdle:
+			idle++
+		case StatusError:
+			errCount++
+		}
+	}
+
+	var parts []string
+	if running > 0 {
+		parts = append(parts, statusRunning.Render(fmt.Sprintf("%d running", running)))
+	}
+	if planning > 0 {
+		parts = append(parts, statusPlanning.Render(fmt.Sprintf("%d planning", planning)))
+	}
+	if waiting > 0 {
+		parts = append(parts, statusWaiting.Render(fmt.Sprintf("%d waiting", waiting)))
+	}
+	if idle > 0 {
+		parts = append(parts, statusIdle.Render(fmt.Sprintf("%d idle", idle)))
+	}
+	if errCount > 0 {
+		parts = append(parts, statusError.Render(fmt.Sprintf("%d error", errCount)))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, dimStyle.Render(" / "))
+}
+
 func (m Model) View() string {
 	if m.quitting {
 		return ""
 	}
 
+	// Compute max agent name length for alignment
+	maxNameLen := 0
+	for _, a := range m.flatAgents {
+		if len(a.Name) > maxNameLen {
+			maxNameLen = len(a.Name)
+		}
+	}
+	// Add space for " ◀" attached indicator
+	maxNameLen += 3
+
 	var content strings.Builder
 
-	// Title
-	content.WriteString(titleStyle.Render("Agent Monitor"))
+	// Gradient title
+	content.WriteString(m.renderGradientTitle(" Agent Monitor "))
 	content.WriteString("\n")
-	content.WriteString(dimStyle.Render(fmt.Sprintf("%d agents", len(m.flatAgents))))
+
+	// Status summary or agent count
+	if len(m.flatAgents) > 0 {
+		content.WriteString(m.renderStatusSummary())
+	} else {
+		content.WriteString(dimStyle.Render("0 agents"))
+	}
 	content.WriteString("\n\n")
 
 	if len(m.flatAgents) == 0 {
@@ -686,7 +822,7 @@ func (m Model) View() string {
 			content.WriteString("\n")
 
 			for _, agent := range g.Agents {
-				content.WriteString(m.renderAgentLine(agent, agentIdx))
+				content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen))
 				content.WriteString("\n")
 				agentIdx++
 			}
@@ -694,7 +830,7 @@ func (m Model) View() string {
 	} else {
 		// Flat rendering (no config or single implicit group)
 		for i, agent := range m.flatAgents {
-			content.WriteString(m.renderAgentLine(agent, i))
+			content.WriteString(m.renderAgentLine(agent, i, maxNameLen))
 			content.WriteString("\n")
 		}
 	}
