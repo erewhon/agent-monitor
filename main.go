@@ -384,17 +384,24 @@ func (m Model) attachToAgent(agent Agent) tea.Cmd {
 	return func() tea.Msg {
 		target := agent.Target()
 
-		// Kill any existing process in the right pane and attach to the agent's session
-		// Using the outer tmux socket to control the right pane
-		script := fmt.Sprintf(
-			"tmux -L %s send-keys -t 0.1 C-c ; "+
-				"tmux -L %s send-keys -t 0.1 'tmux attach-session -t %s' Enter",
-			m.outerSocket, m.outerSocket, target)
+		// First, detach any currently attached tmux session in the right pane
+		// by sending the detach command (C-b d for default prefix)
+		// This returns us to the shell
+		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", "C-b", "d").Run()
 
-		cmd := exec.Command("sh", "-c", script)
-		err := cmd.Run()
+		// Small delay to let detach complete
+		time.Sleep(150 * time.Millisecond)
 
-		return attachResultMsg{target: target, err: err}
+		// Kill any other process (like the placeholder)
+		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", "C-c").Run()
+		time.Sleep(50 * time.Millisecond)
+
+		// Send the attach command
+		// unset TMUX so nested attach works
+		attachCmd := fmt.Sprintf("unset TMUX; tmux attach-session -t '%s'", target)
+		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", attachCmd, "Enter").Run()
+
+		return attachResultMsg{target: target, err: nil}
 	}
 }
 

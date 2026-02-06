@@ -1,41 +1,31 @@
 #!/bin/bash
-# Animated placeholder for the right pane
-# Shows a gentle animation until an agent is attached
+# Simple placeholder for the right pane
+# Exits cleanly on any signal so attach can take over
 
-# Hide cursor
-tput civis
-trap 'tput cnorm; exit' EXIT INT TERM
+trap 'exit 0' EXIT INT TERM
+
+clear
 
 # Colors
 DIM='\033[2m'
 PURPLE='\033[35m'
 RESET='\033[0m'
 
-# Animation frames
-frames=('◜' '◠' '◝' '◞' '◡' '◟')
+# Get terminal size
+cols=$(tput cols)
+rows=$(tput lines)
+center_row=$((rows / 2))
+center_col=$((cols / 2))
 
-clear
+# Draw centered message
+tput cup $((center_row - 1)) $((center_col - 15))
+echo -e "${PURPLE}◇${RESET}${DIM}  Select an agent from the left${RESET}"
 
+tput cup $((center_row + 1)) $((center_col - 10))
+echo -e "${DIM}Enter to attach, l to focus${RESET}"
+
+# Just wait (sleep in a way that's interruptible)
 while true; do
-    for frame in "${frames[@]}"; do
-        # Get terminal size
-        cols=$(tput cols)
-        rows=$(tput lines)
-
-        # Center position
-        center_row=$((rows / 2))
-        center_col=$((cols / 2))
-
-        # Clear and draw
-        tput cup $((center_row - 2)) $((center_col - 15))
-        echo -e "${PURPLE}${frame}${RESET}${DIM}  Select an agent from the left${RESET}"
-
-        tput cup $((center_row)) $((center_col - 12))
-        echo -e "${DIM}j/k to navigate, Enter to view${RESET}"
-
-        tput cup $((center_row + 2)) $((center_col - 10))
-        echo -e "${DIM}l or → to focus this pane${RESET}"
-
-        sleep 0.15
-    done
+    sleep 86400 &
+    wait $!
 done

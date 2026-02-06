@@ -41,8 +41,8 @@ tmux -L "$SOCKET" split-window -h -t "$SESSION" -l 80%
 # Unset TMUX so agent-monitor sees the default socket, not the outer one
 tmux -L "$SOCKET" send-keys -t "$SESSION:0.0" "unset TMUX; exec agent-monitor --socket=$SOCKET" Enter
 
-# Right pane (pane 1): run an animated placeholder
-tmux -L "$SOCKET" send-keys -t "$SESSION:0.1" "exec $HOME/.local/bin/agent-monitor-placeholder" Enter
+# Right pane (pane 1): run a placeholder (no exec, so shell stays for attach command)
+tmux -L "$SOCKET" send-keys -t "$SESSION:0.1" "$HOME/.local/bin/agent-monitor-placeholder" Enter
 
 # Focus the left pane
 tmux -L "$SOCKET" select-pane -t "$SESSION:0.0"
