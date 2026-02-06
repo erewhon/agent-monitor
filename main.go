@@ -354,6 +354,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, detectAgents
 		}
 
+	case tea.MouseMsg:
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			// Calculate which agent was clicked (accounting for header lines)
+			// Title + count + blank line = 3 lines before agent list
+			clickedIdx := msg.Y - 4
+			if clickedIdx >= 0 && clickedIdx < len(m.agents) {
+				m.cursor = clickedIdx
+				// Double-click detection is tricky, so single click selects, Enter to attach
+			}
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -384,22 +395,13 @@ func (m Model) attachToAgent(agent Agent) tea.Cmd {
 	return func() tea.Msg {
 		target := agent.Target()
 
-		// First, detach any currently attached tmux session in the right pane
-		// by sending the detach command (C-b d for default prefix)
-		// This returns us to the shell
-		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", "C-b", "d").Run()
+		// Use respawn-pane to kill whatever is running and start fresh with the attach command
+		// This cleanly handles: placeholder, attached tmux session, or anything else
+		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", target)
+		exec.Command("tmux", "-L", m.outerSocket, "respawn-pane", "-k", "-t", "0.1", attachCmd).Run()
 
-		// Small delay to let detach complete
-		time.Sleep(150 * time.Millisecond)
-
-		// Kill any other process (like the placeholder)
-		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", "C-c").Run()
-		time.Sleep(50 * time.Millisecond)
-
-		// Send the attach command
-		// unset TMUX so nested attach works
-		attachCmd := fmt.Sprintf("unset TMUX; tmux attach-session -t '%s'", target)
-		exec.Command("tmux", "-L", m.outerSocket, "send-keys", "-t", "0.1", attachCmd, "Enter").Run()
+		// Focus the right pane
+		exec.Command("tmux", "-L", m.outerSocket, "select-pane", "-t", "0.1").Run()
 
 		return attachResultMsg{target: target, err: nil}
 	}
@@ -525,7 +527,7 @@ func main() {
 		return
 	}
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
