@@ -147,6 +147,7 @@ type Model struct {
 	groups       []Group  // Computed groups for display
 	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
 	spinnerFrame int      // Animation frame counter
+	showActivity bool     // Toggle: show last activity line under each agent
 }
 
 // Messages
@@ -476,16 +477,21 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 // skipping prompts, separators, and UI chrome.
 func findActivityLine(lines []string) string {
 	skipPatterns := []string{
-		"⏵⏵",
+		"⏵",
 		"────",
 		"❯",
-		"erewhon@",
+		"@",             // user@host prompt lines
 		"Esc to cancel",
 		"Tab to amend",
 		"Do you want",
 		"accept edits",
 		"plan mode",
 		"Context left",
+		"Yes, and don't",
+		"Press Enter",
+		"ctrl+o",
+		"(y/n)",
+		"[y/N]",
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
@@ -543,6 +549,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, keys.Refresh):
 			return m, detectAgents
+
+		case key.Matches(msg, keys.ToggleActivity):
+			m.showActivity = !m.showActivity
 		}
 
 	case tea.MouseMsg:
@@ -593,8 +602,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// agentLineHeight returns how many lines an agent occupies.
+func (m Model) agentLineHeight(agent Agent) int {
+	if m.showActivity && agent.LastLine != "" {
+		return 2
+	}
+	return 1
+}
+
 // mouseYToAgentIndex converts a mouse Y coordinate to a flatAgents index,
-// accounting for panel borders, title lines, and group headers.
+// accounting for panel borders, title lines, group headers, and multi-line agents.
 func (m Model) mouseYToAgentIndex(y int) int {
 	// Panel top border = 1, title = 1, count = 1, blank = 1 => content starts at y=4
 	line := 4
@@ -604,23 +621,25 @@ func (m Model) mouseYToAgentIndex(y int) int {
 		for _, g := range m.groups {
 			// Group header line
 			if y == line {
-				return -1 // clicked on header
+				return -1
 			}
 			line++
-			for range g.Agents {
-				if y == line {
+			for _, agent := range g.Agents {
+				h := m.agentLineHeight(agent)
+				if y >= line && y < line+h {
 					return agentIdx
 				}
-				line++
+				line += h
 				agentIdx++
 			}
 		}
 	} else {
-		for i := range m.flatAgents {
-			if y == line {
+		for i, agent := range m.flatAgents {
+			h := m.agentLineHeight(agent)
+			if y >= line && y < line+h {
 				return i
 			}
-			line++
+			line += h
 		}
 	}
 	return -1
@@ -674,7 +693,8 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 	}
 }
 
-// renderAgentLine renders a single agent line with status symbol, name, and last activity.
+// renderAgentLine renders an agent line with status symbol and name,
+// plus an optional second line showing last activity in dim text.
 func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
 	symbol := m.renderStatusSymbol(agent)
 
@@ -683,23 +703,26 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
 		name = attachedStyle.Render(name + " ◀")
 	}
 
-	line := fmt.Sprintf("%s %-*s", symbol, maxNameLen, name)
-
-	// Show truncated last activity in dim text
-	if agent.LastLine != "" {
-		activity := agent.LastLine
-		// Trim available width: 2 (indent) + 2 (symbol+space) + maxNameLen + 2 (gap)
-		maxActivity := m.width - 8 - maxNameLen
-		if maxActivity > 6 {
-			activity = truncate(activity, maxActivity)
-			line += "  " + dimStyle.Render(activity)
-		}
-	}
+	line := fmt.Sprintf("%s %s", symbol, name)
 
 	if idx == m.cursor {
-		return selectedStyle.Render("> " + line)
+		line = selectedStyle.Render("> " + line)
+	} else {
+		line = normalStyle.Render("  " + line)
 	}
-	return normalStyle.Render("  " + line)
+
+	// Second line: last activity (only when toggled on)
+	if m.showActivity && agent.LastLine != "" {
+		// Truncate to fit panel width: panel border (2) + padding (2) + indent (6)
+		maxActivity := m.width - 12
+		if maxActivity < 10 {
+			maxActivity = 10
+		}
+		activity := truncate(agent.LastLine, maxActivity)
+		line += "\n" + dimStyle.Render("      "+activity)
+	}
+
+	return line
 }
 
 // renderGradientTitle renders the title with a subtle shimmer effect.
@@ -849,7 +872,7 @@ func (m Model) View() string {
 	agentPanel := panelStyle.Width(panelWidth).Render(content.String())
 
 	// Help bar with its own border
-	helpText := helpStyle.Render("j/k:nav  ⏎:attach  l:focus  r:refresh  q:quit")
+	helpText := helpStyle.Render("j/k:nav  ⏎:attach  l:focus  a:activity  r:refresh  q:quit")
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
 	return agentPanel + "\n" + helpPanel
@@ -857,12 +880,13 @@ func (m Model) View() string {
 
 // Key bindings
 type keyMap struct {
-	Up         key.Binding
-	Down       key.Binding
-	Attach     key.Binding
-	FocusRight key.Binding
-	Refresh    key.Binding
-	Quit       key.Binding
+	Up             key.Binding
+	Down           key.Binding
+	Attach         key.Binding
+	FocusRight     key.Binding
+	Refresh        key.Binding
+	ToggleActivity key.Binding
+	Quit           key.Binding
 }
 
 var keys = keyMap{
@@ -880,6 +904,9 @@ var keys = keyMap{
 	),
 	Refresh: key.NewBinding(
 		key.WithKeys("r"),
+	),
+	ToggleActivity: key.NewBinding(
+		key.WithKeys("a"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
