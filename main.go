@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -77,21 +79,63 @@ func (a Agent) Target() string {
 	return fmt.Sprintf("%s:%d.%d", a.Session, a.Window, a.Pane)
 }
 
+// Config types for group configuration
+type GroupConfig struct {
+	Name     string   `yaml:"name"`
+	Sessions []string `yaml:"sessions"`
+}
+
+type Config struct {
+	Groups []GroupConfig `yaml:"groups"`
+}
+
+// Group holds a named group of agents for display
+type Group struct {
+	Name   string
+	Agents []Agent
+}
+
+// loadConfig reads the groups config from ~/.config/agent-monitor/groups.yaml
+func loadConfig() Config {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Config{}
+	}
+	path := filepath.Join(home, ".config", "agent-monitor", "groups.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return Config{}
+	}
+	return cfg
+}
+
+// Spinner frames for running agents
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
 // Model is the Bubble Tea model
 type Model struct {
-	agents      []Agent
-	cursor      int
-	width       int
-	height      int
-	outerSocket string // Socket for outer tmux (to control right pane)
-	attached    string // Currently attached agent target
-	err         error
-	quitting    bool
+	agents       []Agent
+	cursor       int
+	width        int
+	height       int
+	outerSocket  string // Socket for outer tmux (to control right pane)
+	attached     string // Currently attached agent target
+	err          error
+	quitting     bool
+	config       Config   // Loaded group config
+	groups       []Group  // Computed groups for display
+	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
+	spinnerFrame int      // Animation frame counter
 }
 
 // Messages
 type tickMsg time.Time
 type agentUpdateMsg []Agent
+type spinnerTickMsg time.Time
 type attachResultMsg struct {
 	target string
 	err    error
@@ -101,7 +145,9 @@ type attachResultMsg struct {
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("99"))
+			Foreground(lipgloss.Color("#cc66ff")).
+			Background(lipgloss.Color("#1a0033")).
+			Padding(0, 1)
 
 	selectedStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -132,6 +178,28 @@ var (
 	attachedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("82")).
 			Bold(true)
+
+	panelStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#9933ff")).
+			Padding(0, 1)
+
+	helpPanelStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#4a0080")).
+			Padding(0, 1)
+
+	// Cycling group header colors (purple/violet shades)
+	groupHeaderColors = []lipgloss.Color{
+		lipgloss.Color("#cc66ff"),
+		lipgloss.Color("#b84dff"),
+		lipgloss.Color("#a333ff"),
+		lipgloss.Color("#9933ff"),
+		lipgloss.Color("#8c1aff"),
+	}
+
+	// "Other" group gets a dimmer blue-gray
+	otherGroupColor = lipgloss.Color("#6677aa")
 )
 
 func initialModel() Model {
@@ -139,13 +207,78 @@ func initialModel() Model {
 		agents:      []Agent{},
 		cursor:      0,
 		outerSocket: *outerSocket,
+		config:      loadConfig(),
 	}
+}
+
+// buildGroups maps agents into config-defined groups and computes flatAgents.
+func (m *Model) buildGroups() {
+	if len(m.config.Groups) == 0 {
+		// No config — flat list, no headers
+		m.groups = nil
+		m.flatAgents = m.agents
+		return
+	}
+
+	// Build a lookup: session name -> config group index
+	sessionToGroup := make(map[string]int)
+	for i, gc := range m.config.Groups {
+		for _, s := range gc.Sessions {
+			sessionToGroup[s] = i
+		}
+	}
+
+	// Bucket agents into groups
+	buckets := make([][]Agent, len(m.config.Groups))
+	var other []Agent
+	for _, agent := range m.agents {
+		if idx, ok := sessionToGroup[agent.Session]; ok {
+			buckets[idx] = append(buckets[idx], agent)
+		} else {
+			other = append(other, agent)
+		}
+	}
+
+	// Build groups preserving config order, skip empty groups
+	m.groups = nil
+	m.flatAgents = nil
+	for i, gc := range m.config.Groups {
+		if len(buckets[i]) == 0 {
+			continue
+		}
+		g := Group{Name: gc.Name, Agents: buckets[i]}
+		m.groups = append(m.groups, g)
+		m.flatAgents = append(m.flatAgents, buckets[i]...)
+	}
+	if len(other) > 0 {
+		g := Group{Name: "Other", Agents: other}
+		m.groups = append(m.groups, g)
+		m.flatAgents = append(m.flatAgents, other...)
+	}
+}
+
+// spinnerTickCmd sends a tick every 100ms for spinner animation.
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg(t)
+	})
+}
+
+// hasRunningAgents checks if any agent has StatusRunning.
+func (m Model) hasRunningAgents() bool {
+	for _, a := range m.agents {
+		if a.Status == StatusRunning {
+			return true
+		}
+	}
+	return false
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		tickCmd(),
 		detectAgents,
+		spinnerTickCmd(),
 	)
 }
 
@@ -336,18 +469,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case key.Matches(msg, keys.Down):
-			if m.cursor < len(m.agents)-1 {
+			if m.cursor < len(m.flatAgents)-1 {
 				m.cursor++
 			}
 
 		case key.Matches(msg, keys.Attach):
-			if len(m.agents) > 0 && m.cursor < len(m.agents) && !*noAttach {
-				agent := m.agents[m.cursor]
+			if len(m.flatAgents) > 0 && m.cursor < len(m.flatAgents) && !*noAttach {
+				agent := m.flatAgents[m.cursor]
 				return m, m.attachToAgent(agent)
 			}
 
 		case key.Matches(msg, keys.FocusRight):
-			// Focus the right pane (where agent is attached)
 			return m, m.focusRightPane()
 
 		case key.Matches(msg, keys.Refresh):
@@ -356,12 +488,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Calculate which agent was clicked (accounting for header lines)
-			// Title + count + blank line = 3 lines before agent list
-			clickedIdx := msg.Y - 4
-			if clickedIdx >= 0 && clickedIdx < len(m.agents) {
-				m.cursor = clickedIdx
-				// Double-click detection is tricky, so single click selects, Enter to attach
+			// Account for panel border (1 line) + title + count + blank = 4 lines offset
+			// Plus group headers before the clicked position
+			clickedY := msg.Y
+			idx := m.mouseYToAgentIndex(clickedY)
+			if idx >= 0 && idx < len(m.flatAgents) {
+				m.cursor = idx
 			}
 		}
 
@@ -372,10 +504,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tea.Batch(tickCmd(), detectAgents)
 
+	case spinnerTickMsg:
+		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		if m.hasRunningAgents() {
+			return m, spinnerTickCmd()
+		}
+		return m, nil
+
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
-		if m.cursor >= len(m.agents) && len(m.agents) > 0 {
-			m.cursor = len(m.agents) - 1
+		m.buildGroups()
+		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
+			m.cursor = len(m.flatAgents) - 1
+		}
+		// Start spinner if there are running agents
+		if m.hasRunningAgents() {
+			return m, spinnerTickCmd()
 		}
 
 	case attachResultMsg:
@@ -388,6 +532,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// mouseYToAgentIndex converts a mouse Y coordinate to a flatAgents index,
+// accounting for panel borders, title lines, and group headers.
+func (m Model) mouseYToAgentIndex(y int) int {
+	// Panel top border = 1, title = 1, count = 1, blank = 1 => content starts at y=4
+	line := 4
+	agentIdx := 0
+
+	if m.groups != nil {
+		for _, g := range m.groups {
+			// Group header line
+			if y == line {
+				return -1 // clicked on header
+			}
+			line++
+			for range g.Agents {
+				if y == line {
+					return agentIdx
+				}
+				line++
+				agentIdx++
+			}
+		}
+	} else {
+		for i := range m.flatAgents {
+			if y == line {
+				return i
+			}
+			line++
+		}
+	}
+	return -1
 }
 
 // attachToAgent updates the right pane to show the selected agent
@@ -416,67 +593,106 @@ func (m Model) focusRightPane() tea.Cmd {
 	}
 }
 
+// renderStatusSymbol returns the colored status symbol for an agent,
+// using animated spinner for running agents.
+func (m Model) renderStatusSymbol(agent Agent) string {
+	switch agent.Status {
+	case StatusRunning:
+		frame := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
+		return statusRunning.Render(frame)
+	case StatusWaiting:
+		return statusWaiting.Render(agent.Status.Symbol())
+	case StatusIdle:
+		return statusIdle.Render(agent.Status.Symbol())
+	case StatusError:
+		return statusError.Render(agent.Status.Symbol())
+	default:
+		return agent.Status.Symbol()
+	}
+}
+
+// renderAgentLine renders a single agent line with status symbol and name.
+func (m Model) renderAgentLine(agent Agent, idx int) string {
+	symbol := m.renderStatusSymbol(agent)
+
+	name := agent.Name
+	if agent.Target() == m.attached {
+		name = attachedStyle.Render(name + " ◀")
+	}
+
+	line := fmt.Sprintf("%s %s", symbol, name)
+
+	if idx == m.cursor {
+		return selectedStyle.Render("> " + line)
+	}
+	return normalStyle.Render("  " + line)
+}
+
 func (m Model) View() string {
 	if m.quitting {
 		return ""
 	}
 
-	var b strings.Builder
+	var content strings.Builder
 
 	// Title
-	b.WriteString(titleStyle.Render("Agent Monitor"))
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(fmt.Sprintf("%d agents", len(m.agents))))
-	b.WriteString("\n\n")
+	content.WriteString(titleStyle.Render("Agent Monitor"))
+	content.WriteString("\n")
+	content.WriteString(dimStyle.Render(fmt.Sprintf("%d agents", len(m.flatAgents))))
+	content.WriteString("\n\n")
 
-	if len(m.agents) == 0 {
-		b.WriteString(normalStyle.Render("No agents found.\n"))
-		b.WriteString(dimStyle.Render("Start claude in tmux.\n"))
-	} else {
-		for i, agent := range m.agents {
-			// Status symbol with color
-			var symbol string
-			switch agent.Status {
-			case StatusRunning:
-				symbol = statusRunning.Render(agent.Status.Symbol())
-			case StatusWaiting:
-				symbol = statusWaiting.Render(agent.Status.Symbol())
-			case StatusIdle:
-				symbol = statusIdle.Render(agent.Status.Symbol())
-			case StatusError:
-				symbol = statusError.Render(agent.Status.Symbol())
-			default:
-				symbol = agent.Status.Symbol()
-			}
-
-			// Show attached indicator
-			name := agent.Name
-			if agent.Target() == m.attached {
-				name = attachedStyle.Render(name + " ◀")
-			}
-
-			line := fmt.Sprintf("%s %s", symbol, name)
-
-			if i == m.cursor {
-				b.WriteString(selectedStyle.Render("> " + line))
+	if len(m.flatAgents) == 0 {
+		content.WriteString(normalStyle.Render("No agents found.\n"))
+		content.WriteString(dimStyle.Render("Start claude in tmux.\n"))
+	} else if m.groups != nil {
+		// Grouped rendering
+		agentIdx := 0
+		for gi, g := range m.groups {
+			// Group header with cycling colors
+			var headerColor lipgloss.Color
+			if g.Name == "Other" {
+				headerColor = otherGroupColor
 			} else {
-				b.WriteString(normalStyle.Render("  " + line))
+				headerColor = groupHeaderColors[gi%len(groupHeaderColors)]
 			}
-			b.WriteString("\n")
+			headerStyle := lipgloss.NewStyle().
+				Bold(true).
+				Foreground(headerColor)
+			content.WriteString(headerStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
+			content.WriteString("\n")
+
+			for _, agent := range g.Agents {
+				content.WriteString(m.renderAgentLine(agent, agentIdx))
+				content.WriteString("\n")
+				agentIdx++
+			}
+		}
+	} else {
+		// Flat rendering (no config or single implicit group)
+		for i, agent := range m.flatAgents {
+			content.WriteString(m.renderAgentLine(agent, i))
+			content.WriteString("\n")
 		}
 	}
 
-	// Status line
-	b.WriteString("\n")
+	// Error line
 	if m.err != nil {
-		b.WriteString(statusError.Render(fmt.Sprintf("Error: %v", m.err)))
-		b.WriteString("\n")
+		content.WriteString("\n")
+		content.WriteString(statusError.Render(fmt.Sprintf("Error: %v", m.err)))
 	}
 
-	// Help
-	b.WriteString(helpStyle.Render("j/k:nav  ⏎:attach  l:focus  r:refresh  q:quit"))
+	// Apply panel border to agent list
+	panelWidth := m.width - 2 // account for border
+	if panelWidth < 20 {
+		panelWidth = 20
+	}
+	agentPanel := panelStyle.Width(panelWidth).Render(content.String())
 
-	return b.String()
+	// Help bar with its own border
+	helpText := helpStyle.Render("j/k:nav  ⏎:attach  l:focus  r:refresh  q:quit")
+	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
+
+	return agentPanel + "\n" + helpPanel
 }
 
 // Key bindings
