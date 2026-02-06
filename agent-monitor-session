@@ -1,0 +1,51 @@
+#!/bin/bash
+# Launch agent-monitor in its own tmux session with split layout
+#
+# Usage: agent-monitor-session
+#
+# This creates an outer tmux session with:
+# - Left pane: agent-monitor TUI
+# - Right pane: attached view of selected agent
+#
+# The outer tmux uses a different socket (-L agent-monitor) and
+# prefix (C-a) to avoid conflicts with your regular tmux sessions.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Look for config in standard locations
+if [[ -f "$HOME/.config/agent-monitor-tmux.conf" ]]; then
+    CONFIG="$HOME/.config/agent-monitor-tmux.conf"
+elif [[ -f "$SCRIPT_DIR/tmux-outer.conf" ]]; then
+    CONFIG="$SCRIPT_DIR/tmux-outer.conf"
+else
+    echo "Error: tmux config not found" >&2
+    exit 1
+fi
+SOCKET="agent-monitor"
+SESSION="agent-monitor"
+
+# Check if session already exists
+if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+    echo "Agent monitor session already running. Attaching..."
+    exec tmux -L "$SOCKET" attach-session -t "$SESSION"
+fi
+
+# Create new session with agent-monitor in left pane
+tmux -L "$SOCKET" -f "$CONFIG" new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
+
+# Set up the layout: narrow left pane for list, wide right for preview
+tmux -L "$SOCKET" split-window -h -t "$SESSION" -l 80%
+
+# Left pane (pane 0): run agent-monitor
+# Unset TMUX so agent-monitor sees the default socket, not the outer one
+tmux -L "$SOCKET" send-keys -t "$SESSION:0.0" "unset TMUX; exec agent-monitor --socket=$SOCKET" Enter
+
+# Right pane (pane 1): run an animated placeholder
+tmux -L "$SOCKET" send-keys -t "$SESSION:0.1" "exec $HOME/.local/bin/agent-monitor-placeholder" Enter
+
+# Focus the left pane
+tmux -L "$SOCKET" select-pane -t "$SESSION:0.0"
+
+# Attach to the session
+exec tmux -L "$SOCKET" attach-session -t "$SESSION"

@@ -1,0 +1,18 @@
+#!/bin/bash
+# Switch focus back to the agent-monitor pane in the outer tmux
+#
+# Add this to your inner tmux config:
+#   bind-key M-m run-shell "~/.local/bin/focus-agent-monitor"
+#
+# Or bind it to a function key:
+#   bind-key F12 run-shell "~/.local/bin/focus-agent-monitor"
+
+SOCKET="agent-monitor"
+
+# Check if the outer tmux session exists
+if tmux -L "$SOCKET" has-session 2>/dev/null; then
+    # Focus the left pane (agent-monitor) in the outer session
+    tmux -L "$SOCKET" select-pane -t 0.0
+else
+    echo "Agent monitor session not running"
+fi
