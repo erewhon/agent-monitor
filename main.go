@@ -27,17 +27,20 @@ var (
 type AgentStatus int
 
 const (
-	StatusUnknown AgentStatus = iota
-	StatusRunning             // Agent is actively working (streaming output)
-	StatusWaiting             // Waiting for user input
-	StatusIdle                // Idle/ready for input
-	StatusError               // Error state
+	StatusUnknown  AgentStatus = iota
+	StatusRunning              // Agent is actively working (streaming output)
+	StatusPlanning             // Agent is in plan mode (exploring/designing)
+	StatusWaiting              // Waiting for user input
+	StatusIdle                 // Idle/ready for input
+	StatusError                // Error state
 )
 
 func (s AgentStatus) String() string {
 	switch s {
 	case StatusRunning:
 		return "running"
+	case StatusPlanning:
+		return "planning"
 	case StatusWaiting:
 		return "waiting"
 	case StatusIdle:
@@ -53,6 +56,8 @@ func (s AgentStatus) Symbol() string {
 	switch s {
 	case StatusRunning:
 		return "●" // Green dot
+	case StatusPlanning:
+		return "◇" // Diamond (planning)
 	case StatusWaiting:
 		return "◐" // Half circle (needs input)
 	case StatusIdle:
@@ -116,6 +121,9 @@ func loadConfig() Config {
 // Spinner frames for running agents
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// Planning frames — pulsing diamond (slower cycle via frame division)
+var planningFrames = []string{"◇", "◇", "◈", "◆", "◆", "◈"}
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents       []Agent
@@ -165,6 +173,9 @@ var (
 
 	statusWaiting = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("220")) // Yellow
+
+	statusPlanning = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("141")) // Light purple
 
 	statusIdle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("245")) // Gray
@@ -259,15 +270,15 @@ func (m *Model) buildGroups() {
 
 // spinnerTickCmd sends a tick every 100ms for spinner animation.
 func spinnerTickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
 		return spinnerTickMsg(t)
 	})
 }
 
-// hasRunningAgents checks if any agent has StatusRunning.
-func (m Model) hasRunningAgents() bool {
+// hasAnimatedAgents checks if any agent needs animation (running or planning).
+func (m Model) hasAnimatedAgents() bool {
 	for _, a := range m.agents {
-		if a.Status == StatusRunning {
+		if a.Status == StatusRunning || a.Status == StatusPlanning {
 			return true
 		}
 	}
@@ -371,9 +382,10 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 
 	lines := strings.Split(string(output), "\n")
 
-	// Find last few non-empty lines for context
+	// Collect last 20 non-empty lines for pattern matching.
+	// Needs to be large enough to see past task checklists that appear below the spinner.
 	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line != "" {
 			lastLines = append([]string{line}, lastLines...)
@@ -385,22 +397,42 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 		lastLine = lastLines[len(lastLines)-1]
 	}
 
-	// Check last 10 lines for patterns (more accurate than whole buffer)
 	recentContent := strings.Join(lastLines, "\n")
-	content := string(output)
 
-	// Running: streaming output indicators (check recent content first)
-	runningPatterns := []string{
-		"Running…",
-		"⎿  Running",
-		"Thinking…",
-		"Waiting…",
+	// --- Active work detection ---
+	// All running patterns are line-start-anchored to avoid false positives
+	// from response text that mentions these words mid-paragraph.
+
+	// Active spinner: Claude Code shows activity as "<char> <text>… (<duration> · ...)"
+	// The char varies (✻ ✢ ✶ * etc.) but the timing suffix is consistent.
+	// Match any line with "…" followed by a parenthesized duration.
+	activeSpinner := regexp.MustCompile(`(?m)…\s+\(\d+[ms]`)
+	if activeSpinner.MatchString(recentContent) {
+		return StatusRunning, truncate(lastLine, 50)
 	}
-	for _, pattern := range runningPatterns {
-		if strings.Contains(recentContent, pattern) {
-			return StatusRunning, truncate(lastLine, 50)
-		}
+
+	// Also match spinner lines by prefix char + text + … (without timing, for early display)
+	activeSpinnerAlt := regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+.+…`)
+	if activeSpinnerAlt.MatchString(recentContent) {
+		return StatusRunning, truncate(lastLine, 50)
 	}
+
+	// Tool execution: ⎿ at line start followed by Running
+	if regexp.MustCompile(`(?m)^⎿\s+Running`).MatchString(recentContent) {
+		return StatusRunning, truncate(lastLine, 50)
+	}
+
+	// Subagent execution: "Running N ... agents…" at line start
+	if regexp.MustCompile(`(?m)^●\s+Running\s+\d+`).MatchString(recentContent) {
+		return StatusRunning, truncate(lastLine, 50)
+	}
+
+	// Streaming indicators at line start (e.g. "* Thinking…" shown during generation)
+	if regexp.MustCompile(`(?m)^\*\s+(Thinking|Waiting)…`).MatchString(recentContent) {
+		return StatusRunning, truncate(lastLine, 50)
+	}
+
+	// --- UI states (checked on wider recent content) ---
 
 	// Waiting for PERMISSION: shows selection prompt for approval
 	permissionPatterns := []string{
@@ -421,25 +453,14 @@ func detectAgentStatus(target string) (AgentStatus, string) {
 		}
 	}
 
-	// Idle at prompt: ready for new command input
-	promptPatterns := []string{
-		"⏵⏵",
-		"────────────",
-	}
-	for _, pattern := range promptPatterns {
-		if strings.Contains(recentContent, pattern) {
-			if strings.Contains(lastLine, "⏵") || strings.Contains(lastLine, "accept edits") {
-				return StatusIdle, truncate(lastLine, 50)
-			}
-		}
+	// Plan mode: agent is exploring/designing
+	if strings.Contains(recentContent, "plan mode") {
+		return StatusPlanning, truncate(lastLine, 50)
 	}
 
-	// Check for recent activity by looking for tool indicators
-	toolPattern := regexp.MustCompile(`●\s*(Bash|Read|Write|Edit|Glob|Grep|Task)`)
-	if toolPattern.MatchString(content) {
-		if strings.Contains(lastLine, "⎿") && !strings.Contains(lastLine, "Running") {
-			return StatusIdle, truncate(lastLine, 50)
-		}
+	// Idle at prompt: ready for new command input
+	if strings.Contains(lastLine, "⏵⏵") || strings.Contains(lastLine, "accept edits") {
+		return StatusIdle, truncate(lastLine, 50)
 	}
 
 	return StatusIdle, truncate(lastLine, 50)
@@ -506,7 +527,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-		if m.hasRunningAgents() {
+		if m.hasAnimatedAgents() {
 			return m, spinnerTickCmd()
 		}
 		return m, nil
@@ -518,7 +539,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = len(m.flatAgents) - 1
 		}
 		// Start spinner if there are running agents
-		if m.hasRunningAgents() {
+		if m.hasAnimatedAgents() {
 			return m, spinnerTickCmd()
 		}
 
@@ -600,6 +621,9 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 	case StatusRunning:
 		frame := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
 		return statusRunning.Render(frame)
+	case StatusPlanning:
+		frame := planningFrames[m.spinnerFrame%len(planningFrames)]
+		return statusPlanning.Render(frame)
 	case StatusWaiting:
 		return statusWaiting.Render(agent.Status.Symbol())
 	case StatusIdle:
