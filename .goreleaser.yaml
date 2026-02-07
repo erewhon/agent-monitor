@@ -37,7 +37,7 @@ changelog:
       - "^test:"
       - "^ci:"
 
-homebrew_casks:
+brews:
   - name: agent-monitor
     repository:
       owner: erewhon
