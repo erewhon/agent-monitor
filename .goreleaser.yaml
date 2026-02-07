@@ -53,7 +53,7 @@ brews:
       bin.install "agent-monitor-session"
       bin.install "focus-agent-monitor"
       bin.install "agent-monitor-placeholder"
-      etc.install "tmux-outer.conf" => "agent-monitor/tmux-outer.conf"
+      (etc/"agent-monitor").install "tmux-outer.conf"
     caveats: |
       The tmux config has been installed to:
         #{etc}/agent-monitor/tmux-outer.conf
