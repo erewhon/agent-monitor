@@ -6,6 +6,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  release:
+    types: [created]
 
 permissions:
   contents: write
@@ -17,17 +19,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.release.tag_name || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
       - name: Build (non-release)
-        if: "!startsWith(github.ref, 'refs/tags/v')"
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && github.event_name != 'release' }}
         run: go build -o agent-monitor .
 
       - name: Run GoReleaser
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' }}
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
@@ -35,3 +38,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ github.event.release.tag_name || github.ref_name }}
