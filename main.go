@@ -317,41 +317,66 @@ func detectAgents() tea.Msg {
 
 	seen := make(map[string]bool)
 
+	// First pass: collect all panes, keyed by target
+	type paneInfo struct {
+		target  string
+		command string
+	}
+	var panes []paneInfo
+
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 
-		// Only look for claude processes
-		if !strings.Contains(line, "claude") {
-			continue
-		}
-
 		parts := strings.SplitN(line, " ", 2)
-		if len(parts) < 1 {
+		if len(parts) < 2 {
 			continue
 		}
 
 		target := parts[0]
+		command := parts[1]
 
-		// Avoid duplicates
 		if seen[target] {
 			continue
 		}
 		seen[target] = true
 
+		panes = append(panes, paneInfo{target: target, command: command})
+	}
+
+	// Second pass: detect Claude agents.
+	// Direct match: command is "claude"
+	// Indirect match: command is something else (e.g. bash/dx wrapper running claude
+	// in a container) — probe pane content for Claude Code UI indicators.
+	seenSessions := make(map[string]bool)
+
+	for _, p := range panes {
+		isClaude := strings.Contains(p.command, "claude")
+
 		// Parse session:window.pane
-		colonIdx := strings.Index(target, ":")
+		colonIdx := strings.Index(p.target, ":")
 		if colonIdx == -1 {
 			continue
 		}
-
-		session := target[:colonIdx]
-		rest := target[colonIdx+1:]
+		session := p.target[:colonIdx]
+		rest := p.target[colonIdx+1:]
 
 		var window, pane int
 		fmt.Sscanf(rest, "%d.%d", &window, &pane)
+
+		// For non-claude commands, probe pane content for Claude Code indicators.
+		// Only check one pane per session to avoid overhead.
+		if !isClaude {
+			if seenSessions[session] {
+				continue
+			}
+			if !looksLikeClaude(p.target) {
+				continue
+			}
+		}
+		seenSessions[session] = true
 
 		agent := Agent{
 			Name:      session,
@@ -362,9 +387,7 @@ func detectAgents() tea.Msg {
 			UpdatedAt: time.Now(),
 		}
 
-		// Detect status by capturing pane content
-		agent.Status, agent.LastLine = detectAgentStatus(target)
-
+		agent.Status, agent.LastLine = detectAgentStatus(p.target)
 		agents = append(agents, agent)
 	}
 
@@ -374,6 +397,31 @@ func detectAgents() tea.Msg {
 	})
 
 	return agentUpdateMsg(agents)
+}
+
+// looksLikeClaude does a quick content probe to detect Claude Code running
+// in a wrapper (e.g. dx, container). Checks for distinctive UI elements.
+func looksLikeClaude(target string) bool {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	content := string(output)
+	// Claude Code distinctive markers
+	indicators := []string{
+		"Claude Code",
+		"⏵⏵",
+		"claude.ai/code",
+		"ctrl+o",
+		"shift+tab to cycle",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectAgentStatus captures pane content and determines agent state
@@ -556,12 +604,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Account for panel border (1 line) + title + count + blank = 4 lines offset
-			// Plus group headers before the clicked position
-			clickedY := msg.Y
-			idx := m.mouseYToAgentIndex(clickedY)
+			idx := m.mouseYToAgentIndex(msg.Y)
 			if idx >= 0 && idx < len(m.flatAgents) {
 				m.cursor = idx
+				// Immediately attach on click
+				if !*noAttach {
+					return m, m.attachToAgent(m.flatAgents[idx])
+				}
 			}
 		}
 
@@ -611,19 +660,41 @@ func (m Model) agentLineHeight(agent Agent) int {
 }
 
 // mouseYToAgentIndex converts a mouse Y coordinate to a flatAgents index,
-// accounting for panel borders, title lines, group headers, and multi-line agents.
+// dynamically computing the offset by replaying the View layout.
 func (m Model) mouseYToAgentIndex(y int) int {
-	// Panel top border = 1, title = 1, count = 1, blank = 1 => content starts at y=4
-	line := 4
-	agentIdx := 0
+	// Replay the layout to compute line positions:
+	// Y=0: panel top border
+	// Y=1: title line
+	// Y=2: status summary (may wrap — count lines based on panel width)
+	line := 1 // start after top border
+	line++    // title
 
+	// Status summary line
+	summaryText := m.renderStatusSummary()
+	if summaryText == "" {
+		summaryText = "0 agents"
+	}
+	// Estimate if summary wraps (panel inner width = width - 4 for border + padding)
+	innerWidth := m.width - 4
+	if innerWidth < 10 {
+		innerWidth = 10
+	}
+	summaryLen := len([]rune(stripAnsi(summaryText)))
+	summaryLines := 1
+	if innerWidth > 0 && summaryLen > innerWidth {
+		summaryLines = (summaryLen + innerWidth - 1) / innerWidth
+	}
+	line += summaryLines
+
+	line++ // blank line
+
+	agentIdx := 0
 	if m.groups != nil {
 		for _, g := range m.groups {
-			// Group header line
 			if y == line {
-				return -1
+				return -1 // clicked on header
 			}
-			line++
+			line++ // group header
 			for _, agent := range g.Agents {
 				h := m.agentLineHeight(agent)
 				if y >= line && y < line+h {
@@ -643,6 +714,12 @@ func (m Model) mouseYToAgentIndex(y int) int {
 		}
 	}
 	return -1
+}
+
+// stripAnsi removes ANSI escape sequences from a string.
+func stripAnsi(s string) string {
+	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return re.ReplaceAllString(s, "")
 }
 
 // attachToAgent updates the right pane to show the selected agent
