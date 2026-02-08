@@ -317,41 +317,66 @@ func detectAgents() tea.Msg {
 
 	seen := make(map[string]bool)
 
+	// First pass: collect all panes, keyed by target
+	type paneInfo struct {
+		target  string
+		command string
+	}
+	var panes []paneInfo
+
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 
-		// Only look for claude processes
-		if !strings.Contains(line, "claude") {
-			continue
-		}
-
 		parts := strings.SplitN(line, " ", 2)
-		if len(parts) < 1 {
+		if len(parts) < 2 {
 			continue
 		}
 
 		target := parts[0]
+		command := parts[1]
 
-		// Avoid duplicates
 		if seen[target] {
 			continue
 		}
 		seen[target] = true
 
+		panes = append(panes, paneInfo{target: target, command: command})
+	}
+
+	// Second pass: detect Claude agents.
+	// Direct match: command is "claude"
+	// Indirect match: command is something else (e.g. bash/dx wrapper running claude
+	// in a container) — probe pane content for Claude Code UI indicators.
+	seenSessions := make(map[string]bool)
+
+	for _, p := range panes {
+		isClaude := strings.Contains(p.command, "claude")
+
 		// Parse session:window.pane
-		colonIdx := strings.Index(target, ":")
+		colonIdx := strings.Index(p.target, ":")
 		if colonIdx == -1 {
 			continue
 		}
-
-		session := target[:colonIdx]
-		rest := target[colonIdx+1:]
+		session := p.target[:colonIdx]
+		rest := p.target[colonIdx+1:]
 
 		var window, pane int
 		fmt.Sscanf(rest, "%d.%d", &window, &pane)
+
+		// For non-claude commands, probe pane content for Claude Code indicators.
+		// Only check one pane per session to avoid overhead.
+		if !isClaude {
+			if seenSessions[session] {
+				continue
+			}
+			if !looksLikeClaude(p.target) {
+				continue
+			}
+		}
+		seenSessions[session] = true
 
 		agent := Agent{
 			Name:      session,
@@ -362,9 +387,7 @@ func detectAgents() tea.Msg {
 			UpdatedAt: time.Now(),
 		}
 
-		// Detect status by capturing pane content
-		agent.Status, agent.LastLine = detectAgentStatus(target)
-
+		agent.Status, agent.LastLine = detectAgentStatus(p.target)
 		agents = append(agents, agent)
 	}
 
@@ -374,6 +397,31 @@ func detectAgents() tea.Msg {
 	})
 
 	return agentUpdateMsg(agents)
+}
+
+// looksLikeClaude does a quick content probe to detect Claude Code running
+// in a wrapper (e.g. dx, container). Checks for distinctive UI elements.
+func looksLikeClaude(target string) bool {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	content := string(output)
+	// Claude Code distinctive markers
+	indicators := []string{
+		"Claude Code",
+		"⏵⏵",
+		"claude.ai/code",
+		"ctrl+o",
+		"shift+tab to cycle",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectAgentStatus captures pane content and determines agent state
