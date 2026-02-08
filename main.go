@@ -133,6 +133,9 @@ var titleGradient = []lipgloss.Color{
 	"#cc99ff", "#bf80ff", "#b366ff", "#a64dff",
 }
 
+// How long to show the "recently finished" indicator
+const recentIdleDuration = 30 * time.Minute
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents       []Agent
@@ -148,6 +151,7 @@ type Model struct {
 	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
 	spinnerFrame int      // Animation frame counter
 	showActivity bool     // Toggle: show last activity line under each agent
+	lastActiveAt map[string]time.Time // session -> when last seen in an active state
 }
 
 // Messages
@@ -184,6 +188,9 @@ var (
 	statusIdle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("245")) // Gray
 
+	statusRecentIdle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("78")) // Teal/green — recently finished
+
 	statusError = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")) // Red
 
@@ -219,10 +226,11 @@ var (
 
 func initialModel() Model {
 	return Model{
-		agents:      []Agent{},
-		cursor:      0,
-		outerSocket: *outerSocket,
-		config:      loadConfig(),
+		agents:       []Agent{},
+		cursor:       0,
+		outerSocket:  *outerSocket,
+		config:       loadConfig(),
+		lastActiveAt: make(map[string]time.Time),
 	}
 }
 
@@ -287,6 +295,36 @@ func (m Model) hasAnimatedAgents() bool {
 		}
 	}
 	return false
+}
+
+// isRecentlyIdle checks if an idle agent was recently in an active state.
+func (m Model) isRecentlyIdle(agent Agent) bool {
+	if agent.Status != StatusIdle {
+		return false
+	}
+	if t, ok := m.lastActiveAt[agent.Session]; ok {
+		return time.Since(t) < recentIdleDuration
+	}
+	return false
+}
+
+// hasRecentlyIdle checks if any idle agent was recently active.
+func (m Model) hasRecentlyIdle() bool {
+	for _, a := range m.agents {
+		if m.isRecentlyIdle(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// recentIdleAge returns a short human-readable elapsed time string.
+func recentIdleAge(since time.Time) string {
+	d := time.Since(since)
+	if d < time.Minute {
+		return "<1m"
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
 }
 
 func (m Model) Init() tea.Cmd {
@@ -626,16 +664,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.hasAnimatedAgents() {
 			return m, spinnerTickCmd()
 		}
+		// Keep ticking for title shimmer when there are agents
+		if len(m.agents) > 0 {
+			return m, spinnerTickCmd()
+		}
 		return m, nil
 
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
+		// Track when agents are active for "recently idle" indicator
+		for _, a := range m.agents {
+			if a.Status == StatusRunning || a.Status == StatusPlanning || a.Status == StatusWaiting {
+				m.lastActiveAt[a.Session] = time.Now()
+			}
+		}
 		m.buildGroups()
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
 		}
-		// Start spinner if there are running agents
-		if m.hasAnimatedAgents() {
+		// Start spinner if there are running agents or recently idle ones
+		if m.hasAnimatedAgents() || m.hasRecentlyIdle() {
 			return m, spinnerTickCmd()
 		}
 
@@ -665,28 +713,11 @@ func (m Model) mouseYToAgentIndex(y int) int {
 	// Replay the layout to compute line positions:
 	// Y=0: panel top border
 	// Y=1: title line
-	// Y=2: status summary (may wrap — count lines based on panel width)
+	// Y=2: blank line
+	// Y=3+: agents/groups
 	line := 1 // start after top border
 	line++    // title
-
-	// Status summary line
-	summaryText := m.renderStatusSummary()
-	if summaryText == "" {
-		summaryText = "0 agents"
-	}
-	// Estimate if summary wraps (panel inner width = width - 4 for border + padding)
-	innerWidth := m.width - 4
-	if innerWidth < 10 {
-		innerWidth = 10
-	}
-	summaryLen := len([]rune(stripAnsi(summaryText)))
-	summaryLines := 1
-	if innerWidth > 0 && summaryLen > innerWidth {
-		summaryLines = (summaryLen + innerWidth - 1) / innerWidth
-	}
-	line += summaryLines
-
-	line++ // blank line
+	line++    // blank line
 
 	agentIdx := 0
 	if m.groups != nil {
@@ -762,6 +793,9 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 		frame := waitingFrames[m.spinnerFrame%len(waitingFrames)]
 		return statusWaiting.Render(frame)
 	case StatusIdle:
+		if m.isRecentlyIdle(agent) {
+			return statusRecentIdle.Render("✓")
+		}
 		return statusIdle.Render(agent.Status.Symbol())
 	case StatusError:
 		return statusError.Render(agent.Status.Symbol())
@@ -780,7 +814,14 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
 		name = attachedStyle.Render(name + " ◀")
 	}
 
-	line := fmt.Sprintf("%s %s", symbol, name)
+	// Add "done Xm ago" suffix for recently idle agents
+	suffix := ""
+	if m.isRecentlyIdle(agent) {
+		age := recentIdleAge(m.lastActiveAt[agent.Session])
+		suffix = " " + dimStyle.Render("done "+age+" ago")
+	}
+
+	line := fmt.Sprintf("%s %s%s", symbol, name, suffix)
 
 	if idx == m.cursor {
 		line = selectedStyle.Render("> " + line)
@@ -831,9 +872,10 @@ func (m Model) renderGradientTitle(text string) string {
 	return b.String()
 }
 
-// renderStatusSummary renders a colored status summary line.
+// renderStatusSummary renders a compact colored status summary line using symbols.
+// Format: ●2 ◇1 ◐1 ✓3 ○5  (only non-zero counts shown)
 func (m Model) renderStatusSummary() string {
-	var running, planning, waiting, idle, errCount int
+	var running, planning, waiting, idle, recentIdle, errCount int
 	for _, a := range m.flatAgents {
 		switch a.Status {
 		case StatusRunning:
@@ -843,7 +885,11 @@ func (m Model) renderStatusSummary() string {
 		case StatusWaiting:
 			waiting++
 		case StatusIdle:
-			idle++
+			if m.isRecentlyIdle(a) {
+				recentIdle++
+			} else {
+				idle++
+			}
 		case StatusError:
 			errCount++
 		}
@@ -851,25 +897,28 @@ func (m Model) renderStatusSummary() string {
 
 	var parts []string
 	if running > 0 {
-		parts = append(parts, statusRunning.Render(fmt.Sprintf("%d running", running)))
+		parts = append(parts, statusRunning.Render(fmt.Sprintf("●%d", running)))
 	}
 	if planning > 0 {
-		parts = append(parts, statusPlanning.Render(fmt.Sprintf("%d planning", planning)))
+		parts = append(parts, statusPlanning.Render(fmt.Sprintf("◇%d", planning)))
 	}
 	if waiting > 0 {
-		parts = append(parts, statusWaiting.Render(fmt.Sprintf("%d waiting", waiting)))
+		parts = append(parts, statusWaiting.Render(fmt.Sprintf("◐%d", waiting)))
+	}
+	if recentIdle > 0 {
+		parts = append(parts, statusRecentIdle.Render(fmt.Sprintf("✓%d", recentIdle)))
 	}
 	if idle > 0 {
-		parts = append(parts, statusIdle.Render(fmt.Sprintf("%d idle", idle)))
+		parts = append(parts, statusIdle.Render(fmt.Sprintf("○%d", idle)))
 	}
 	if errCount > 0 {
-		parts = append(parts, statusError.Render(fmt.Sprintf("%d error", errCount)))
+		parts = append(parts, statusError.Render(fmt.Sprintf("✕%d", errCount)))
 	}
 
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, dimStyle.Render(" / "))
+	return strings.Join(parts, " ")
 }
 
 func (m Model) View() string {
@@ -891,14 +940,6 @@ func (m Model) View() string {
 
 	// Gradient title
 	content.WriteString(m.renderGradientTitle(" Agent Monitor "))
-	content.WriteString("\n")
-
-	// Status summary or agent count
-	if len(m.flatAgents) > 0 {
-		content.WriteString(m.renderStatusSummary())
-	} else {
-		content.WriteString(dimStyle.Render("0 agents"))
-	}
 	content.WriteString("\n\n")
 
 	if len(m.flatAgents) == 0 {
@@ -931,6 +972,15 @@ func (m Model) View() string {
 		// Flat rendering (no config or single implicit group)
 		for i, agent := range m.flatAgents {
 			content.WriteString(m.renderAgentLine(agent, i, maxNameLen))
+			content.WriteString("\n")
+		}
+	}
+
+	// Status summary at the bottom of the agent list
+	if len(m.flatAgents) > 0 {
+		summary := m.renderStatusSummary()
+		if summary != "" {
+			content.WriteString(dimStyle.Render("─") + " " + summary)
 			content.WriteString("\n")
 		}
 	}
