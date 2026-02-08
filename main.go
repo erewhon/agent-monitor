@@ -149,9 +149,10 @@ type Model struct {
 	config       Config   // Loaded group config
 	groups       []Group  // Computed groups for display
 	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
-	spinnerFrame int      // Animation frame counter
-	showActivity bool     // Toggle: show last activity line under each agent
-	lastActiveAt map[string]time.Time // session -> when last seen in an active state
+	spinnerFrame  int      // Animation frame counter
+	spinnerActive bool     // Whether a spinner tick chain is running
+	showActivity  bool     // Toggle: show last activity line under each agent
+	lastActiveAt  map[string]time.Time // session -> when last seen in an active state
 }
 
 // Messages
@@ -331,7 +332,6 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		tickCmd(),
 		detectAgents,
-		spinnerTickCmd(),
 	)
 }
 
@@ -661,13 +661,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-		if m.hasAnimatedAgents() {
-			return m, spinnerTickCmd()
-		}
-		// Keep ticking for title shimmer when there are agents
+		// Keep ticking while there are agents (for title shimmer + status animations)
 		if len(m.agents) > 0 {
 			return m, spinnerTickCmd()
 		}
+		m.spinnerActive = false
 		return m, nil
 
 	case agentUpdateMsg:
@@ -682,8 +680,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
 		}
-		// Start spinner if there are running agents or recently idle ones
-		if m.hasAnimatedAgents() || m.hasRecentlyIdle() {
+		// Start spinner tick chain if not already running
+		if !m.spinnerActive && len(m.agents) > 0 {
+			m.spinnerActive = true
 			return m, spinnerTickCmd()
 		}
 
