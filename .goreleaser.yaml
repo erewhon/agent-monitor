@@ -47,7 +47,7 @@ brews:
     directory: Formula
     homepage: "https://github.com/erewhon/agent-monitor"
     description: "TUI for tracking Claude Code agents in tmux sessions"
-    license: "MIT"
+    license: "GPL-3.0"
     install: |
       bin.install "agent-monitor"
       bin.install "agent-monitor-session"
