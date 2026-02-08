@@ -818,7 +818,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
 	suffix := ""
 	if m.isRecentlyIdle(agent) {
 		age := recentIdleAge(m.lastActiveAt[agent.Session])
-		suffix = " " + dimStyle.Render("done "+age+" ago")
+		suffix = " " + dimStyle.Render(age)
 	}
 
 	line := fmt.Sprintf("%s %s%s", symbol, name, suffix)
