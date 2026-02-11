@@ -404,6 +404,9 @@ func detectAgents() tea.Msg {
 	// probe pane content for UI indicators.
 	seenSessions := make(map[string]bool)
 
+	// Version-string pattern: Claude Code sets process.title to its version (e.g. "2.1.39")
+	versionCmd := regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
 	for _, p := range panes {
 		agentType := AgentUnknown
 		switch {
@@ -413,6 +416,9 @@ func detectAgents() tea.Msg {
 			agentType = AgentOpenCode
 		case strings.Contains(p.command, "crush"):
 			agentType = AgentCrush
+		case versionCmd.MatchString(p.command):
+			// Claude Code sets process.title to its version number
+			agentType = AgentClaude
 		}
 
 		// Parse session:window.pane
@@ -469,7 +475,8 @@ func detectAgents() tea.Msg {
 }
 
 // looksLikeClaude does a quick content probe to detect Claude Code running
-// in a wrapper (e.g. dx, container). Checks for distinctive UI elements.
+// in a wrapper (e.g. dx, container) or when process.title is the version number.
+// Checks for distinctive UI elements visible in both idle and active states.
 func looksLikeClaude(target string) bool {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
 	output, err := cmd.Output()
@@ -477,7 +484,7 @@ func looksLikeClaude(target string) bool {
 		return false
 	}
 	content := string(output)
-	// Claude Code distinctive markers
+	// Idle-state markers
 	indicators := []string{
 		"Claude Code",
 		"⏵⏵",
@@ -489,6 +496,24 @@ func looksLikeClaude(target string) bool {
 		if strings.Contains(content, ind) {
 			return true
 		}
+	}
+	// Active-state markers: tool output, spinners, permission prompts
+	// These are visible when Claude is running and the idle prompt has scrolled off.
+	activePatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?m)…\s+\(\d+[ms]`),          // spinner with timing: "… (5s"
+		regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+`),   // spinner prefix chars
+		regexp.MustCompile(`(?m)^⎿`),                      // tool result marker
+		regexp.MustCompile(`(?m)^●\s+Running\s+\d+`),      // subagent execution
+	}
+	for _, re := range activePatterns {
+		if re.MatchString(content) {
+			return true
+		}
+	}
+	// Permission prompts unique to Claude Code
+	if strings.Contains(content, "Yes, and don't ask") ||
+		strings.Contains(content, "Do you want to proceed?") {
+		return true
 	}
 	return false
 }
