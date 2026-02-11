@@ -1,6 +1,6 @@
 # Agent Monitor
 
-A terminal UI for tracking multiple Claude Code agents running in tmux sessions.
+A terminal UI for tracking multiple coding agents running in tmux sessions. Supports **Claude Code**, **OpenCode**, and **Crush**.
 
 ## Features
 
@@ -111,8 +111,8 @@ groups:
 ## How It Works
 
 1. **Outer tmux session**: Runs on a separate socket (`-L agent-monitor`) with its own config and prefix (`C-a`) to avoid conflicts with your regular tmux
-2. **Agent detection**: Scans all panes in the default tmux socket for processes named `claude`
-3. **Status detection**: Captures pane content to detect state based on Claude Code output patterns
+2. **Agent detection**: Scans all panes in the default tmux socket for processes named `claude`, `opencode`, or `crush`. Falls back to content probing for agents running inside wrappers (e.g. dx, containers)
+3. **Status detection**: Captures pane content to detect state based on each agent type's UI patterns
 4. **Live attachment**: When you press Enter, the right pane attaches to the selected agent's actual tmux session
 
 ## Standalone modes
@@ -139,4 +139,4 @@ agent-monitor --no-attach
 
 - Go 1.21+
 - tmux
-- Claude Code running in tmux sessions
+- One or more coding agents running in tmux sessions (Claude Code, OpenCode, or Crush)
