@@ -108,10 +108,23 @@ type Config struct {
 	Groups []GroupConfig `yaml:"groups"`
 }
 
+// SubGroup holds agents that share a slash-prefix (e.g. "code/branch1", "code/main")
+type SubGroup struct {
+	Prefix string
+	Agents []Agent
+}
+
+// GroupItem is either a single agent or a sub-group of agents
+type GroupItem struct {
+	IsSubGroup bool
+	Agent      Agent    // when IsSubGroup=false
+	SubGroup   SubGroup // when IsSubGroup=true
+}
+
 // Group holds a named group of agents for display
 type Group struct {
-	Name   string
-	Agents []Agent
+	Name  string
+	Items []GroupItem
 }
 
 // loadConfig reads the groups config from ~/.config/agent-monitor/groups.yaml
@@ -249,20 +262,84 @@ func initialModel() Model {
 	}
 }
 
+// computeItems organizes a list of agents into GroupItems, bundling
+// consecutive agents that share a slash-prefix into SubGroups.
+func computeItems(agents []Agent) []GroupItem {
+	sort.Slice(agents, func(i, j int) bool {
+		return agents[i].Name < agents[j].Name
+	})
+
+	var items []GroupItem
+	i := 0
+	for i < len(agents) {
+		slashIdx := strings.Index(agents[i].Name, "/")
+		if slashIdx == -1 {
+			// No slash — plain agent
+			items = append(items, GroupItem{Agent: agents[i]})
+			i++
+			continue
+		}
+		// Collect all agents with the same prefix
+		prefix := agents[i].Name[:slashIdx]
+		var subAgents []Agent
+		for i < len(agents) && strings.HasPrefix(agents[i].Name, prefix+"/") {
+			subAgents = append(subAgents, agents[i])
+			i++
+		}
+		items = append(items, GroupItem{
+			IsSubGroup: true,
+			SubGroup:   SubGroup{Prefix: prefix, Agents: subAgents},
+		})
+	}
+	return items
+}
+
+// flattenItems extracts agents from items in display order.
+func flattenItems(items []GroupItem) []Agent {
+	var out []Agent
+	for _, item := range items {
+		if item.IsSubGroup {
+			out = append(out, item.SubGroup.Agents...)
+		} else {
+			out = append(out, item.Agent)
+		}
+	}
+	return out
+}
+
 // buildGroups maps agents into config-defined groups and computes flatAgents.
 func (m *Model) buildGroups() {
 	if len(m.config.Groups) == 0 {
-		// No config — flat list, no headers
-		m.groups = nil
-		m.flatAgents = m.agents
+		// No config — flat list with sub-groups but no group headers
+		if len(m.agents) == 0 {
+			m.groups = nil
+			m.flatAgents = nil
+			return
+		}
+		items := computeItems(m.agents)
+		m.groups = []Group{{Name: "", Items: items}}
+		m.flatAgents = flattenItems(items)
 		return
 	}
 
-	// Build a lookup: session name -> config group index
-	sessionToGroup := make(map[string]int)
+	// Build lookups: exact session name -> group index, and wildcard prefixes
+	exactMatch := make(map[string]int)
+	type wildcardEntry struct {
+		prefix   string
+		groupIdx int
+	}
+	var wildcards []wildcardEntry
+
 	for i, gc := range m.config.Groups {
 		for _, s := range gc.Sessions {
-			sessionToGroup[s] = i
+			if strings.HasSuffix(s, "/*") {
+				wildcards = append(wildcards, wildcardEntry{
+					prefix:   strings.TrimSuffix(s, "/*"),
+					groupIdx: i,
+				})
+			} else {
+				exactMatch[s] = i
+			}
 		}
 	}
 
@@ -270,10 +347,20 @@ func (m *Model) buildGroups() {
 	buckets := make([][]Agent, len(m.config.Groups))
 	var other []Agent
 	for _, agent := range m.agents {
-		if idx, ok := sessionToGroup[agent.Session]; ok {
+		if idx, ok := exactMatch[agent.Session]; ok {
 			buckets[idx] = append(buckets[idx], agent)
 		} else {
-			other = append(other, agent)
+			matched := false
+			for _, wc := range wildcards {
+				if strings.HasPrefix(agent.Session, wc.prefix+"/") {
+					buckets[wc.groupIdx] = append(buckets[wc.groupIdx], agent)
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				other = append(other, agent)
+			}
 		}
 	}
 
@@ -284,14 +371,16 @@ func (m *Model) buildGroups() {
 		if len(buckets[i]) == 0 {
 			continue
 		}
-		g := Group{Name: gc.Name, Agents: buckets[i]}
+		items := computeItems(buckets[i])
+		g := Group{Name: gc.Name, Items: items}
 		m.groups = append(m.groups, g)
-		m.flatAgents = append(m.flatAgents, buckets[i]...)
+		m.flatAgents = append(m.flatAgents, flattenItems(items)...)
 	}
 	if len(other) > 0 {
-		g := Group{Name: "Other", Agents: other}
+		items := computeItems(other)
+		g := Group{Name: "Other", Items: items}
 		m.groups = append(m.groups, g)
-		m.flatAgents = append(m.flatAgents, other...)
+		m.flatAgents = append(m.flatAgents, flattenItems(items)...)
 	}
 }
 
@@ -981,28 +1070,38 @@ func (m Model) mouseYToAgentIndex(y int) int {
 	line++    // blank line
 
 	agentIdx := 0
-	if m.groups != nil {
-		for _, g := range m.groups {
+	for _, g := range m.groups {
+		// Group header (skip for empty name — flat mode)
+		if g.Name != "" {
 			if y == line {
-				return -1 // clicked on header
+				return -1 // clicked on group header
 			}
-			line++ // group header
-			for _, agent := range g.Agents {
-				h := m.agentLineHeight(agent)
+			line++
+		}
+
+		for _, item := range g.Items {
+			if item.IsSubGroup {
+				// Sub-group header line
+				if y == line {
+					return -1 // clicked on sub-group header
+				}
+				line++
+				for _, agent := range item.SubGroup.Agents {
+					h := m.agentLineHeight(agent)
+					if y >= line && y < line+h {
+						return agentIdx
+					}
+					line += h
+					agentIdx++
+				}
+			} else {
+				h := m.agentLineHeight(item.Agent)
 				if y >= line && y < line+h {
 					return agentIdx
 				}
 				line += h
 				agentIdx++
 			}
-		}
-	} else {
-		for i, agent := range m.flatAgents {
-			h := m.agentLineHeight(agent)
-			if y >= line && y < line+h {
-				return i
-			}
-			line += h
 		}
 	}
 	return -1
@@ -1067,10 +1166,14 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 
 // renderAgentLine renders an agent line with status symbol and name,
 // plus an optional second line showing last activity in dim text.
-func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int) string {
+// If displayName is non-empty, it is shown instead of agent.Name (for sub-grouped agents).
+func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string) string {
 	symbol := m.renderStatusSymbol(agent)
 
 	name := agent.Name
+	if displayName != "" {
+		name = displayName
+	}
 	if agent.Target() == m.attached {
 		name = attachedStyle.Render(name + " ◀")
 	}
@@ -1206,34 +1309,42 @@ func (m Model) View() string {
 	if len(m.flatAgents) == 0 {
 		content.WriteString(normalStyle.Render("No agents found.\n"))
 		content.WriteString(dimStyle.Render("Start an agent in tmux.\n"))
-	} else if m.groups != nil {
-		// Grouped rendering
+	} else {
 		agentIdx := 0
 		for gi, g := range m.groups {
-			// Group header with cycling colors
-			var headerColor lipgloss.Color
-			if g.Name == "Other" {
-				headerColor = otherGroupColor
-			} else {
-				headerColor = groupHeaderColors[gi%len(groupHeaderColors)]
-			}
-			headerStyle := lipgloss.NewStyle().
-				Bold(true).
-				Foreground(headerColor)
-			content.WriteString(headerStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
-			content.WriteString("\n")
-
-			for _, agent := range g.Agents {
-				content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen))
+			// Group header (skip for empty name — flat mode)
+			if g.Name != "" {
+				var headerColor lipgloss.Color
+				if g.Name == "Other" {
+					headerColor = otherGroupColor
+				} else {
+					headerColor = groupHeaderColors[gi%len(groupHeaderColors)]
+				}
+				headerStyle := lipgloss.NewStyle().
+					Bold(true).
+					Foreground(headerColor)
+				content.WriteString(headerStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
 				content.WriteString("\n")
-				agentIdx++
 			}
-		}
-	} else {
-		// Flat rendering (no config or single implicit group)
-		for i, agent := range m.flatAgents {
-			content.WriteString(m.renderAgentLine(agent, i, maxNameLen))
-			content.WriteString("\n")
+
+			for _, item := range g.Items {
+				if item.IsSubGroup {
+					// Sub-group header
+					content.WriteString(dimStyle.Render(fmt.Sprintf("  ├ %s", item.SubGroup.Prefix)))
+					content.WriteString("\n")
+					for _, agent := range item.SubGroup.Agents {
+						// Show only the suffix after the slash
+						suffix := agent.Name[len(item.SubGroup.Prefix)+1:]
+						content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen, suffix))
+						content.WriteString("\n")
+						agentIdx++
+					}
+				} else {
+					content.WriteString(m.renderAgentLine(item.Agent, agentIdx, maxNameLen, ""))
+					content.WriteString("\n")
+					agentIdx++
+				}
+			}
 		}
 	}
 
