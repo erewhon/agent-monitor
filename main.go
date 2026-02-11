@@ -17,6 +17,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// version is set at build time via ldflags
+var version = "dev"
+
 var (
 	listOnly    = flag.Bool("list", false, "List agents and exit (no TUI)")
 	outerSocket = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
@@ -1212,7 +1215,8 @@ func (m Model) View() string {
 	agentPanel := panelStyle.Width(panelWidth).Render(content.String())
 
 	// Help bar with its own border
-	helpText := helpStyle.Render("j/k:nav  ⏎:attach  l:focus  a:activity  r:refresh  q:quit")
+	helpKeys := "j/k:nav  ⏎:attach  l:focus  a:activity  r:refresh  q:quit"
+	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
 	return agentPanel + "\n" + helpPanel
