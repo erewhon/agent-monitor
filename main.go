@@ -1167,7 +1167,8 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 // renderAgentLine renders an agent line with status symbol and name,
 // plus an optional second line showing last activity in dim text.
 // If displayName is non-empty, it is shown instead of agent.Name (for sub-grouped agents).
-func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string) string {
+// indent is prepended before the cursor/selection prefix (used for sub-group nesting).
+func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string, indent string) string {
 	symbol := m.renderStatusSymbol(agent)
 
 	name := agent.Name
@@ -1188,20 +1189,20 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	line := fmt.Sprintf("%s %s%s", symbol, name, suffix)
 
 	if idx == m.cursor {
-		line = selectedStyle.Render("> " + line)
+		line = selectedStyle.Render(indent + "> " + line)
 	} else {
-		line = normalStyle.Render("  " + line)
+		line = normalStyle.Render(indent + "  " + line)
 	}
 
 	// Second line: last activity (only when toggled on)
 	if m.showActivity && agent.LastLine != "" {
-		// Truncate to fit panel width: panel border (2) + padding (2) + indent (6)
-		maxActivity := m.width - 12
+		// Truncate to fit panel width: panel border (2) + padding (2) + indent (6) + extra indent
+		maxActivity := m.width - 12 - len(indent)
 		if maxActivity < 10 {
 			maxActivity = 10
 		}
 		activity := truncate(agent.LastLine, maxActivity)
-		line += "\n" + dimStyle.Render("      "+activity)
+		line += "\n" + dimStyle.Render(indent+"      "+activity)
 	}
 
 	return line
@@ -1335,12 +1336,12 @@ func (m Model) View() string {
 					for _, agent := range item.SubGroup.Agents {
 						// Show only the suffix after the slash
 						suffix := agent.Name[len(item.SubGroup.Prefix)+1:]
-						content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen, suffix))
+						content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen, suffix, "  "))
 						content.WriteString("\n")
 						agentIdx++
 					}
 				} else {
-					content.WriteString(m.renderAgentLine(item.Agent, agentIdx, maxNameLen, ""))
+					content.WriteString(m.renderAgentLine(item.Agent, agentIdx, maxNameLen, "", ""))
 					content.WriteString("\n")
 					agentIdx++
 				}
