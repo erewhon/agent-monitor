@@ -23,6 +23,16 @@ var (
 	noAttach    = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
 )
 
+// Agent type identifies which coding agent tool is running
+type AgentType string
+
+const (
+	AgentClaude   AgentType = "claude"
+	AgentOpenCode AgentType = "opencode"
+	AgentCrush    AgentType = "crush"
+	AgentUnknown  AgentType = "unknown"
+)
+
 // Agent status
 type AgentStatus int
 
@@ -69,12 +79,13 @@ func (s AgentStatus) Symbol() string {
 	}
 }
 
-// Agent represents a tracked Claude Code agent
+// Agent represents a tracked coding agent (Claude Code, OpenCode, or Crush)
 type Agent struct {
 	Name      string
 	Session   string // tmux session name
 	Window    int    // tmux window index
 	Pane      int    // tmux pane index
+	Type      AgentType
 	Status    AgentStatus
 	LastLine  string // Last line of output (for status detection)
 	UpdatedAt time.Time
@@ -384,14 +395,22 @@ func detectAgents() tea.Msg {
 		panes = append(panes, paneInfo{target: target, command: command})
 	}
 
-	// Second pass: detect Claude agents.
-	// Direct match: command is "claude"
-	// Indirect match: command is something else (e.g. bash/dx wrapper running claude
-	// in a container) — probe pane content for Claude Code UI indicators.
+	// Second pass: detect coding agents (Claude Code, OpenCode, Crush).
+	// Direct match: command contains "claude", "opencode", or "crush"
+	// Indirect match: command is something else (e.g. bash/dx wrapper) —
+	// probe pane content for UI indicators.
 	seenSessions := make(map[string]bool)
 
 	for _, p := range panes {
-		isClaude := strings.Contains(p.command, "claude")
+		agentType := AgentUnknown
+		switch {
+		case strings.Contains(p.command, "claude"):
+			agentType = AgentClaude
+		case strings.Contains(p.command, "opencode"):
+			agentType = AgentOpenCode
+		case strings.Contains(p.command, "crush"):
+			agentType = AgentCrush
+		}
 
 		// Parse session:window.pane
 		colonIdx := strings.Index(p.target, ":")
@@ -404,13 +423,21 @@ func detectAgents() tea.Msg {
 		var window, pane int
 		fmt.Sscanf(rest, "%d.%d", &window, &pane)
 
-		// For non-claude commands, probe pane content for Claude Code indicators.
+		// For unknown commands, probe pane content for agent UI indicators.
 		// Only check one pane per session to avoid overhead.
-		if !isClaude {
+		if agentType == AgentUnknown {
 			if seenSessions[session] {
 				continue
 			}
-			if !looksLikeClaude(p.target) {
+			// Try each agent type's content probe in order
+			switch {
+			case looksLikeClaude(p.target):
+				agentType = AgentClaude
+			case looksLikeCrush(p.target):
+				agentType = AgentCrush
+			case looksLikeOpenCode(p.target):
+				agentType = AgentOpenCode
+			default:
 				continue
 			}
 		}
@@ -421,11 +448,12 @@ func detectAgents() tea.Msg {
 			Session:   session,
 			Window:    window,
 			Pane:      pane,
+			Type:      agentType,
 			Status:    StatusUnknown,
 			UpdatedAt: time.Now(),
 		}
 
-		agent.Status, agent.LastLine = detectAgentStatus(p.target)
+		agent.Status, agent.LastLine = detectAgentStatus(p.target, agentType)
 		agents = append(agents, agent)
 	}
 
@@ -462,8 +490,63 @@ func looksLikeClaude(target string) bool {
 	return false
 }
 
-// detectAgentStatus captures pane content and determines agent state
-func detectAgentStatus(target string) (AgentStatus, string) {
+// looksLikeCrush does a quick content probe to detect Crush running in a wrapper.
+func looksLikeCrush(target string) bool {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	content := string(output)
+	indicators := []string{
+		"crush>",
+		"Crush",
+		"crush.json",
+		"💘",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeOpenCode does a quick content probe to detect OpenCode running in a wrapper.
+func looksLikeOpenCode(target string) bool {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	content := string(output)
+	indicators := []string{
+		"opencode>",
+		"OpenCode",
+		"opencode.json",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectAgentStatus dispatches to the appropriate status detector by agent type.
+func detectAgentStatus(target string, agentType AgentType) (AgentStatus, string) {
+	switch agentType {
+	case AgentCrush:
+		return detectCrushStatus(target)
+	case AgentOpenCode:
+		return detectOpenCodeStatus(target)
+	default:
+		return detectClaudeStatus(target)
+	}
+}
+
+// detectClaudeStatus captures pane content and determines Claude Code agent state.
+func detectClaudeStatus(target string) (AgentStatus, string) {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
 	output, err := cmd.Output()
 	if err != nil {
@@ -578,6 +661,14 @@ func findActivityLine(lines []string) string {
 		"ctrl+o",
 		"(y/n)",
 		"[y/N]",
+		"[y/n]",
+		"[Y/n]",
+		"crush>",
+		"opencode>",
+		"Ready!",
+		"Ready...",
+		"Allow",
+		"Deny",
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
@@ -594,6 +685,129 @@ func findActivityLine(lines []string) string {
 		}
 	}
 	return ""
+}
+
+// detectCrushStatus captures pane content and determines Crush agent state.
+func detectCrushStatus(target string) (AgentStatus, string) {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return StatusError, ""
+	}
+
+	lines := strings.Split(string(output), "\n")
+
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{line}, lastLines...)
+		}
+	}
+
+	activityLine := findActivityLine(lastLines)
+	recentContent := strings.Join(lastLines, "\n")
+
+	// Running: active work indicators
+	runningPatterns := []string{
+		"Working...", "Thinking...", "Generating...",
+		"Processing...", "Brrrrr...", "Prrrrrrrr...",
+	}
+	for _, pat := range runningPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusRunning, truncate(activityLine, 60)
+		}
+	}
+	// Spinner animation (Bubble Tea spinners)
+	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+
+	// Waiting: permission dialogs
+	waitingPatterns := []string{
+		"Allow", "Deny",
+		"[y/n]", "[Y/n]", "(y/n)",
+	}
+	for _, pat := range waitingPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusWaiting, truncate(activityLine, 60)
+		}
+	}
+
+	// Idle: at prompt or ready
+	var lastLine string
+	if len(lastLines) > 0 {
+		lastLine = lastLines[len(lastLines)-1]
+	}
+	if strings.Contains(lastLine, "crush>") ||
+		strings.Contains(recentContent, "Ready!") ||
+		strings.Contains(recentContent, "Ready...") ||
+		strings.Contains(recentContent, "Ready for instructions") {
+		return StatusIdle, truncate(activityLine, 60)
+	}
+
+	return StatusIdle, truncate(activityLine, 60)
+}
+
+// detectOpenCodeStatus captures pane content and determines OpenCode agent state.
+func detectOpenCodeStatus(target string) (AgentStatus, string) {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return StatusError, ""
+	}
+
+	lines := strings.Split(string(output), "\n")
+
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{line}, lastLines...)
+		}
+	}
+
+	activityLine := findActivityLine(lastLines)
+	recentContent := strings.Join(lastLines, "\n")
+
+	// Running: active work indicators
+	runningPatterns := []string{
+		"Working...", "Thinking...", "Processing...",
+	}
+	for _, pat := range runningPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusRunning, truncate(activityLine, 60)
+		}
+	}
+	// Spinner animation
+	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+
+	// Waiting: permission dialogs
+	waitingPatterns := []string{
+		"[y/n]", "[Y/n]", "(y/n)",
+	}
+	for _, pat := range waitingPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusWaiting, truncate(activityLine, 60)
+		}
+	}
+	// OpenCode permission dialog uses a/A/d keys
+	if regexp.MustCompile(`(?m)\ba\b.*\bA\b.*\bd\b`).MatchString(recentContent) {
+		return StatusWaiting, truncate(activityLine, 60)
+	}
+
+	// Idle: at prompt
+	var lastLine string
+	if len(lastLines) > 0 {
+		lastLine = lastLines[len(lastLines)-1]
+	}
+	if strings.Contains(lastLine, "opencode>") {
+		return StatusIdle, truncate(activityLine, 60)
+	}
+
+	return StatusIdle, truncate(activityLine, 60)
 }
 
 func truncate(s string, maxLen int) string {
@@ -943,7 +1157,7 @@ func (m Model) View() string {
 
 	if len(m.flatAgents) == 0 {
 		content.WriteString(normalStyle.Render("No agents found.\n"))
-		content.WriteString(dimStyle.Render("Start claude in tmux.\n"))
+		content.WriteString(dimStyle.Render("Start an agent in tmux.\n"))
 	} else if m.groups != nil {
 		// Grouped rendering
 		agentIdx := 0
@@ -1046,7 +1260,7 @@ func main() {
 	if *listOnly {
 		agents := detectAgentsSync()
 		if len(agents) == 0 {
-			fmt.Println("No Claude Code agents detected.")
+			fmt.Println("No agents detected.")
 			return
 		}
 		for _, agent := range agents {

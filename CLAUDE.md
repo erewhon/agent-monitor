@@ -27,7 +27,8 @@ agent-monitor --list
 Single-file Go TUI (`main.go`) using the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework (Elm architecture: Model/Update/View). No tests currently.
 
 **Core types:**
-- `Agent` — represents a Claude Code instance detected in a tmux pane (session:window.pane targeting)
+- `Agent` — represents a coding agent instance (Claude Code, OpenCode, or Crush) detected in a tmux pane (session:window.pane targeting)
+- `AgentType` — enum: Claude/OpenCode/Crush/Unknown, determines which detection patterns to use
 - `Model` — Bubble Tea model holding agent list, cursor position, groups, flatAgents, and outer tmux socket reference
 - `AgentStatus` — enum: Running/Waiting/Idle/Error, detected via pattern matching on captured tmux pane content
 - `Config` / `GroupConfig` — YAML-mapped structs for agent grouping config
@@ -35,7 +36,7 @@ Single-file Go TUI (`main.go`) using the [Bubble Tea](https://github.com/charmbr
 
 **Config file:** `~/.config/agent-monitor/groups.yaml` — optional YAML file that defines named groups of agents by session name. If missing or malformed, agents display in a flat list.
 
-**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, filters for panes running `claude`, then `detectAgentStatus()` captures each pane's content and matches against known Claude Code output patterns (prompt indicators, tool names, permission dialogs) to classify status.
+**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`, then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`) that match against each tool's UI patterns.
 
 **Nested tmux design:** The monitor runs inside an "outer" tmux session on a separate socket (`-L agent-monitor`) with prefix `C-a`, so it doesn't conflict with users' regular tmux (`C-b`). The outer session has two panes: left = TUI, right = live attach to selected agent's tmux session via `respawn-pane`.
 
