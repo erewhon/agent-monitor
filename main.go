@@ -516,6 +516,7 @@ func looksLikeCrush(target string) bool {
 }
 
 // looksLikeOpenCode does a quick content probe to detect OpenCode running in a wrapper.
+// OpenCode's Bubble Tea TUI has distinctive bottom-bar elements that are always visible.
 func looksLikeOpenCode(target string) bool {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
 	output, err := cmd.Output()
@@ -523,15 +524,19 @@ func looksLikeOpenCode(target string) bool {
 		return false
 	}
 	content := string(output)
-	indicators := []string{
-		"opencode>",
-		"OpenCode",
-		"opencode.json",
-	}
-	for _, ind := range indicators {
+	// Primary: branding text (may not render at all widths)
+	for _, ind := range []string{"OpenCode", "opencode>"} {
 		if strings.Contains(content, ind) {
 			return true
 		}
+	}
+	// Secondary: bottom bar has "ctrl+p commands" AND one of the state indicators.
+	// This combination is unique to OpenCode.
+	if strings.Contains(content, "ctrl+p commands") &&
+		(strings.Contains(content, "tab agents") ||
+			strings.Contains(content, "tab switch agent") ||
+			strings.Contains(content, "esc interrupt")) {
+		return true
 	}
 	return false
 }
@@ -672,6 +677,18 @@ func findActivityLine(lines []string) string {
 		"Ready...",
 		"Allow",
 		"Deny",
+		"OpenCode",
+		"switch agent",
+		"tab agents",
+		"ctrl+p",
+		"esc interrupt",
+		"▀▀▀▀",
+		"▣",
+		"⬝⬝",
+		"■■",
+		"tokens",
+		"% used",
+		"spent",
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
@@ -753,6 +770,11 @@ func detectCrushStatus(target string) (AgentStatus, string) {
 }
 
 // detectOpenCodeStatus captures pane content and determines OpenCode agent state.
+// OpenCode is a Bubble Tea TUI with a status bar at bottom showing "• OpenCode X.Y.Z".
+// Running state indicators:
+//   - Progress bar with ■/⬝ characters and "esc interrupt" in the bottom bar
+//   - Tool call lines prefixed with ✱ (e.g. "✱ Glob ...")
+// Idle state: bottom bar shows "tab switch agent" / "tab agents"
 func detectOpenCodeStatus(target string) (AgentStatus, string) {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
 	output, err := cmd.Output()
@@ -760,7 +782,8 @@ func detectOpenCodeStatus(target string) (AgentStatus, string) {
 		return StatusError, ""
 	}
 
-	lines := strings.Split(string(output), "\n")
+	content := string(output)
+	lines := strings.Split(content, "\n")
 
 	var lastLines []string
 	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
@@ -773,7 +796,19 @@ func detectOpenCodeStatus(target string) (AgentStatus, string) {
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
 
-	// Running: active work indicators
+	// Running: "esc interrupt" in bottom bar — definitive running indicator
+	if strings.Contains(recentContent, "esc interrupt") {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+	// Running: progress bar with filled/empty squares
+	if strings.Contains(recentContent, "■") || strings.Contains(recentContent, "⬝") {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+	// Running: tool call lines (✱ prefix)
+	if regexp.MustCompile(`(?m)^✱\s+`).MatchString(recentContent) {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+	// Running: explicit status text
 	runningPatterns := []string{
 		"Working...", "Thinking...", "Processing...",
 	}
@@ -782,34 +817,19 @@ func detectOpenCodeStatus(target string) (AgentStatus, string) {
 			return StatusRunning, truncate(activityLine, 60)
 		}
 	}
-	// Spinner animation
-	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
-	}
 
 	// Waiting: permission dialogs
 	waitingPatterns := []string{
 		"[y/n]", "[Y/n]", "(y/n)",
+		"allow", "deny",
 	}
 	for _, pat := range waitingPatterns {
 		if strings.Contains(recentContent, pat) {
 			return StatusWaiting, truncate(activityLine, 60)
 		}
 	}
-	// OpenCode permission dialog uses a/A/d keys
-	if regexp.MustCompile(`(?m)\ba\b.*\bA\b.*\bd\b`).MatchString(recentContent) {
-		return StatusWaiting, truncate(activityLine, 60)
-	}
 
-	// Idle: at prompt
-	var lastLine string
-	if len(lastLines) > 0 {
-		lastLine = lastLines[len(lastLines)-1]
-	}
-	if strings.Contains(lastLine, "opencode>") {
-		return StatusIdle, truncate(activityLine, 60)
-	}
-
+	// Idle: default state (OpenCode TUI is visible but not actively working)
 	return StatusIdle, truncate(activityLine, 60)
 }
 
