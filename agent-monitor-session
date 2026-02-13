@@ -1,7 +1,9 @@
 #!/bin/bash
 # Launch agent-monitor in its own tmux session with split layout
 #
-# Usage: agent-monitor-session
+# Usage: agent-monitor-session [flags]
+#
+# All flags are passed through to agent-monitor (e.g. --groups "Tech,Self-hosting")
 #
 # This creates an outer tmux session with:
 # - Left pane: agent-monitor TUI
@@ -39,7 +41,8 @@ tmux -L "$SOCKET" split-window -h -t "$SESSION" -l 80%
 
 # Left pane (pane 0): run agent-monitor
 # Unset TMUX so agent-monitor sees the default socket, not the outer one
-tmux -L "$SOCKET" send-keys -t "$SESSION:0.0" "unset TMUX; exec agent-monitor --socket=$SOCKET" Enter
+EXTRA_ARGS="$*"
+tmux -L "$SOCKET" send-keys -t "$SESSION:0.0" "unset TMUX; exec agent-monitor --socket=$SOCKET $EXTRA_ARGS" Enter
 
 # Right pane (pane 1): run a placeholder (no exec, so shell stays for attach command)
 tmux -L "$SOCKET" send-keys -t "$SESSION:0.1" "agent-monitor-placeholder" Enter
