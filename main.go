@@ -24,6 +24,7 @@ var (
 	listOnly    = flag.Bool("list", false, "List agents and exit (no TUI)")
 	outerSocket = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
 	noAttach    = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
+	groupsFlag  = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -180,6 +181,7 @@ type Model struct {
 	spinnerActive bool     // Whether a spinner tick chain is running
 	showActivity  bool     // Toggle: show last activity line under each agent
 	lastActiveAt  map[string]time.Time // session -> when last seen in an active state
+	filterGroups  map[string]bool      // If non-nil, only show these group names
 }
 
 // Messages
@@ -253,13 +255,23 @@ var (
 )
 
 func initialModel() Model {
-	return Model{
+	m := Model{
 		agents:       []Agent{},
 		cursor:       0,
 		outerSocket:  *outerSocket,
 		config:       loadConfig(),
 		lastActiveAt: make(map[string]time.Time),
 	}
+	if *groupsFlag != "" {
+		m.filterGroups = make(map[string]bool)
+		for _, name := range strings.Split(*groupsFlag, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				m.filterGroups[name] = true
+			}
+		}
+	}
+	return m
 }
 
 // computeItems organizes a list of agents into GroupItems, bundling
@@ -371,12 +383,15 @@ func (m *Model) buildGroups() {
 		if len(buckets[i]) == 0 {
 			continue
 		}
+		if m.filterGroups != nil && !m.filterGroups[gc.Name] {
+			continue
+		}
 		items := computeItems(buckets[i])
 		g := Group{Name: gc.Name, Items: items}
 		m.groups = append(m.groups, g)
 		m.flatAgents = append(m.flatAgents, flattenItems(items)...)
 	}
-	if len(other) > 0 {
+	if len(other) > 0 && m.filterGroups == nil {
 		items := computeItems(other)
 		g := Group{Name: "Other", Items: items}
 		m.groups = append(m.groups, g)
@@ -1419,7 +1434,10 @@ func main() {
 
 	// List mode: just print agents and exit
 	if *listOnly {
-		agents := detectAgentsSync()
+		m := initialModel()
+		m.agents = detectAgentsSync()
+		m.buildGroups()
+		agents := m.flatAgents
 		if len(agents) == 0 {
 			fmt.Println("No agents detected.")
 			return
