@@ -752,6 +752,14 @@ func detectCodexStatus(target string) (AgentStatus, string) {
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
 
+	// Running: active thinking/working with timing — "• Something (19s • esc to interrupt)"
+	if strings.Contains(recentContent, "esc to interrupt") {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+	// Running: tool execution lines — "• Ran ..." at line start
+	if regexp.MustCompile(`(?m)^• Ran\s+`).MatchString(recentContent) {
+		return StatusRunning, truncate(activityLine, 60)
+	}
 	// Running: spinner or active work indicators
 	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
 		return StatusRunning, truncate(activityLine, 60)
@@ -951,6 +959,8 @@ func findActivityLine(lines []string) string {
 		"? for shortcuts",
 		"context left",
 		"codex",
+		"esc to interrupt",
+		"• Ran ",
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
