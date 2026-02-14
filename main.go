@@ -34,6 +34,7 @@ const (
 	AgentClaude   AgentType = "claude"
 	AgentOpenCode AgentType = "opencode"
 	AgentCrush    AgentType = "crush"
+	AgentCodex    AgentType = "codex"
 	AgentUnknown  AgentType = "unknown"
 )
 
@@ -80,6 +81,22 @@ func (s AgentStatus) Symbol() string {
 		return "✕" // X mark
 	default:
 		return "?"
+	}
+}
+
+// Badge returns a short dim label identifying the agent type.
+func (t AgentType) Badge() string {
+	switch t {
+	case AgentClaude:
+		return "cc"
+	case AgentCodex:
+		return "cx"
+	case AgentOpenCode:
+		return "oc"
+	case AgentCrush:
+		return "cr"
+	default:
+		return "??"
 	}
 }
 
@@ -520,6 +537,8 @@ func detectAgents() tea.Msg {
 			agentType = AgentOpenCode
 		case strings.Contains(p.command, "crush"):
 			agentType = AgentCrush
+		case strings.Contains(p.command, "codex"):
+			agentType = AgentCodex
 		case versionCmd.MatchString(p.command):
 			// Claude Code sets process.title to its version number
 			agentType = AgentClaude
@@ -550,6 +569,8 @@ func detectAgents() tea.Msg {
 				agentType = AgentCrush
 			case looksLikeOpenCode(p.target):
 				agentType = AgentOpenCode
+			case looksLikeCodex(p.target):
+				agentType = AgentCodex
 			default:
 				continue
 			}
@@ -670,6 +691,96 @@ func looksLikeOpenCode(target string) bool {
 	return false
 }
 
+// looksLikeCodex does a quick content probe to detect OpenAI Codex running in a pane.
+func looksLikeCodex(target string) bool {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	content := string(output)
+	indicators := []string{
+		"OpenAI Codex",
+		"codex",
+		"? for shortcuts",
+		"context left",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectCodexStatus captures pane content and determines OpenAI Codex agent state.
+// Codex is a Node.js TUI with a box-drawn header showing "OpenAI Codex".
+// Idle state: "›" prompt visible, "? for shortcuts", "context left" in bottom bar.
+func detectCodexStatus(target string) (AgentStatus, string) {
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
+	output, err := cmd.Output()
+	if err != nil {
+		return StatusError, ""
+	}
+
+	lines := strings.Split(string(output), "\n")
+
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{line}, lastLines...)
+		}
+	}
+
+	activityLine := findActivityLine(lastLines)
+	recentContent := strings.Join(lastLines, "\n")
+
+	// Running: spinner or active work indicators
+	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+	runningPatterns := []string{
+		"Working...", "Thinking...", "Generating...",
+		"Processing...", "Executing...",
+	}
+	for _, pat := range runningPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusRunning, truncate(activityLine, 60)
+		}
+	}
+	// Running: sandbox execution
+	if strings.Contains(recentContent, "Running command") ||
+		strings.Contains(recentContent, "Applying patch") {
+		return StatusRunning, truncate(activityLine, 60)
+	}
+
+	// Waiting: permission / approval prompts
+	waitingPatterns := []string{
+		"[y/n]", "[Y/n]", "(y/n)",
+		"Allow", "Deny",
+		"approve", "reject",
+	}
+	for _, pat := range waitingPatterns {
+		if strings.Contains(recentContent, pat) {
+			return StatusWaiting, truncate(activityLine, 60)
+		}
+	}
+
+	// Idle: at prompt
+	var lastLine string
+	if len(lastLines) > 0 {
+		lastLine = lastLines[len(lastLines)-1]
+	}
+	if strings.Contains(lastLine, "›") ||
+		strings.Contains(recentContent, "? for shortcuts") ||
+		strings.Contains(recentContent, "context left") {
+		return StatusIdle, truncate(activityLine, 60)
+	}
+
+	return StatusIdle, truncate(activityLine, 60)
+}
+
 // detectAgentStatus dispatches to the appropriate status detector by agent type.
 func detectAgentStatus(target string, agentType AgentType) (AgentStatus, string) {
 	switch agentType {
@@ -677,6 +788,8 @@ func detectAgentStatus(target string, agentType AgentType) (AgentStatus, string)
 		return detectCrushStatus(target)
 	case AgentOpenCode:
 		return detectOpenCodeStatus(target)
+	case AgentCodex:
+		return detectCodexStatus(target)
 	default:
 		return detectClaudeStatus(target)
 	}
@@ -818,6 +931,10 @@ func findActivityLine(lines []string) string {
 		"tokens",
 		"% used",
 		"spent",
+		"OpenAI Codex",
+		"? for shortcuts",
+		"context left",
+		"codex",
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
@@ -1201,7 +1318,8 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 		suffix = " " + dimStyle.Render(age)
 	}
 
-	line := fmt.Sprintf("%s %s%s", symbol, name, suffix)
+	badge := dimStyle.Render(agent.Type.Badge())
+	line := fmt.Sprintf("%s %s %s%s", symbol, badge, name, suffix)
 
 	if idx == m.cursor {
 		line = selectedStyle.Render(indent + "> " + line)
@@ -1444,7 +1562,7 @@ func main() {
 		}
 		for _, agent := range agents {
 			symbol := agent.Status.Symbol()
-			fmt.Printf("%s %s (%s)\n", symbol, agent.Name, agent.Status)
+			fmt.Printf("%s %s %s (%s)\n", symbol, agent.Type.Badge(), agent.Name, agent.Status)
 		}
 		return
 	}
