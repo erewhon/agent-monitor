@@ -84,7 +84,7 @@ func (s AgentStatus) Symbol() string {
 	}
 }
 
-// Badge returns a short dim label identifying the agent type.
+// Badge returns a short label identifying the agent type.
 func (t AgentType) Badge() string {
 	switch t {
 	case AgentClaude:
@@ -97,6 +97,22 @@ func (t AgentType) Badge() string {
 		return "cr"
 	default:
 		return "??"
+	}
+}
+
+// BadgeStyle returns the color style for this agent type's badge.
+func (t AgentType) BadgeStyle() lipgloss.Style {
+	switch t {
+	case AgentClaude:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#b388ff")) // light purple
+	case AgentCodex:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#66bb6a")) // green
+	case AgentOpenCode:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#4fc3f7")) // cyan
+	case AgentCrush:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ef5350")) // red/pink
+	default:
+		return dimStyle
 	}
 }
 
@@ -1318,7 +1334,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 		suffix = " " + dimStyle.Render(age)
 	}
 
-	badge := dimStyle.Render(agent.Type.Badge())
+	badge := agent.Type.BadgeStyle().Render(agent.Type.Badge())
 	line := fmt.Sprintf("%s %s %s%s", symbol, badge, name, suffix)
 
 	if idx == m.cursor {
