@@ -197,6 +197,18 @@ var titleGradient = []lipgloss.Color{
 // How long to show the "recently finished" indicator
 const recentIdleDuration = 30 * time.Minute
 
+// How long a toast notification stays visible
+const toastDuration = 6 * time.Second
+
+// Toast represents a temporary notification popup
+type Toast struct {
+	AgentName  string
+	Message    string
+	Badge      string
+	BadgeStyle lipgloss.Style
+	ExpiresAt  time.Time
+}
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents       []Agent
@@ -212,9 +224,11 @@ type Model struct {
 	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
 	spinnerFrame  int      // Animation frame counter
 	spinnerActive bool     // Whether a spinner tick chain is running
-	showActivity  bool     // Toggle: show last activity line under each agent
-	lastActiveAt  map[string]time.Time // session -> when last seen in an active state
-	filterGroups  map[string]bool      // If non-nil, only show these group names
+	showActivity   bool     // Toggle: show last activity line under each agent
+	lastActiveAt   map[string]time.Time // session -> when last seen in an active state
+	filterGroups   map[string]bool      // If non-nil, only show these group names
+	toasts         []Toast
+	previousStatus map[string]AgentStatus // session -> last known status (for transition detection)
 }
 
 // Messages
@@ -285,15 +299,22 @@ var (
 
 	// "Other" group gets a dimmer blue-gray
 	otherGroupColor = lipgloss.Color("#6677aa")
+
+	toastStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("220")). // yellow, matches waiting
+			Padding(0, 1).
+			Background(lipgloss.Color("#1a1a2e"))
 )
 
 func initialModel() Model {
 	m := Model{
-		agents:       []Agent{},
-		cursor:       0,
-		outerSocket:  *outerSocket,
-		config:       loadConfig(),
-		lastActiveAt: make(map[string]time.Time),
+		agents:         []Agent{},
+		cursor:         0,
+		outerSocket:    *outerSocket,
+		config:         loadConfig(),
+		lastActiveAt:   make(map[string]time.Time),
+		previousStatus: make(map[string]AgentStatus),
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -1178,8 +1199,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-		// Keep ticking while there are agents (for title shimmer + status animations)
-		if len(m.agents) > 0 {
+		// Expire old toasts
+		now := time.Now()
+		active := m.toasts[:0]
+		for _, t := range m.toasts {
+			if now.Before(t.ExpiresAt) {
+				active = append(active, t)
+			}
+		}
+		m.toasts = active
+		// Keep ticking while there are agents or active toasts
+		if len(m.agents) > 0 || len(m.toasts) > 0 {
 			return m, spinnerTickCmd()
 		}
 		m.spinnerActive = false
@@ -1187,6 +1217,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
+		// Detect transitions TO waiting and create toasts
+		for _, a := range m.agents {
+			prev, known := m.previousStatus[a.Session]
+			if known && prev != StatusWaiting && a.Status == StatusWaiting {
+				toast := Toast{
+					AgentName:  a.Name,
+					Message:    a.LastLine,
+					Badge:      a.Type.Badge(),
+					BadgeStyle: a.Type.BadgeStyle(),
+					ExpiresAt:  time.Now().Add(toastDuration),
+				}
+				m.toasts = append(m.toasts, toast)
+				if len(m.toasts) > 5 {
+					m.toasts = m.toasts[len(m.toasts)-5:]
+				}
+			}
+		}
+		// Rebuild previousStatus from current agents (cleans up stale entries)
+		newStatus := make(map[string]AgentStatus, len(m.agents))
+		for _, a := range m.agents {
+			newStatus[a.Session] = a.Status
+		}
+		m.previousStatus = newStatus
 		// Track when agents are active for "recently idle" indicator
 		for _, a := range m.agents {
 			if a.Status == StatusRunning || a.Status == StatusPlanning || a.Status == StatusWaiting {
@@ -1453,6 +1506,110 @@ func (m Model) renderStatusSummary() string {
 	return strings.Join(parts, " ")
 }
 
+// renderToasts renders the toast notification stack as a single styled block.
+func (m Model) renderToasts() string {
+	if len(m.toasts) == 0 {
+		return ""
+	}
+	var boxes []string
+	for _, t := range m.toasts {
+		badge := t.BadgeStyle.Render(t.Badge)
+		line1 := badge + " " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Render(t.AgentName)
+		line2 := dimStyle.Render("needs input")
+		content := line1 + "\n" + line2
+		if t.Message != "" {
+			msg := truncate(t.Message, 30)
+			line3 := dimStyle.Render(msg)
+			content += "\n" + line3
+		}
+		boxes = append(boxes, toastStyle.Render(content))
+	}
+	return lipgloss.JoinVertical(lipgloss.Right, boxes...)
+}
+
+// overlayBottomRight composites the toast block onto the base view at the bottom-right.
+func overlayBottomRight(base string, overlay string, screenWidth, screenHeight int) string {
+	if overlay == "" || screenWidth == 0 || screenHeight == 0 {
+		return base
+	}
+	baseLines := strings.Split(base, "\n")
+	// Pad base to screen height
+	for len(baseLines) < screenHeight {
+		baseLines = append(baseLines, "")
+	}
+	// Truncate to screen height
+	if len(baseLines) > screenHeight {
+		baseLines = baseLines[:screenHeight]
+	}
+
+	overlayLines := strings.Split(overlay, "\n")
+	overlayHeight := len(overlayLines)
+
+	// Compute max visual width of overlay lines
+	overlayWidth := 0
+	for _, ol := range overlayLines {
+		w := lipgloss.Width(ol)
+		if w > overlayWidth {
+			overlayWidth = w
+		}
+	}
+
+	// Skip if toast won't fit
+	if overlayWidth >= screenWidth || overlayHeight >= screenHeight {
+		return base
+	}
+
+	// Position: bottom-right, 1 line up from bottom, 1 col from right edge
+	startRow := screenHeight - overlayHeight - 1
+	if startRow < 0 {
+		startRow = 0
+	}
+	startCol := screenWidth - overlayWidth - 1
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	for i, ol := range overlayLines {
+		row := startRow + i
+		if row >= len(baseLines) {
+			break
+		}
+		baseLine := baseLines[row]
+		baseW := lipgloss.Width(baseLine)
+
+		if baseW < startCol {
+			// Pad the base line to reach the overlay position
+			padding := strings.Repeat(" ", startCol-baseW)
+			baseLines[row] = baseLine + padding + ol
+		} else {
+			// Truncate base line and append overlay
+			// Walk through runes to find the visual-width cutoff point
+			truncated := visualTruncate(baseLine, startCol)
+			baseLines[row] = truncated + ol
+		}
+	}
+
+	return strings.Join(baseLines, "\n")
+}
+
+// visualTruncate truncates a string (possibly containing ANSI codes) to a target visual width.
+func visualTruncate(s string, targetWidth int) string {
+	if lipgloss.Width(s) <= targetWidth {
+		return s + strings.Repeat(" ", targetWidth-lipgloss.Width(s))
+	}
+	// Walk byte by byte, tracking visual width via lipgloss
+	// This is a simple approach: build the string incrementally
+	runes := []rune(s)
+	for i := len(runes); i > 0; i-- {
+		candidate := string(runes[:i])
+		if lipgloss.Width(candidate) <= targetWidth {
+			pad := targetWidth - lipgloss.Width(candidate)
+			return candidate + strings.Repeat(" ", pad)
+		}
+	}
+	return strings.Repeat(" ", targetWidth)
+}
+
 func (m Model) View() string {
 	if m.quitting {
 		return ""
@@ -1543,7 +1700,15 @@ func (m Model) View() string {
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
-	return agentPanel + "\n" + helpPanel
+	base := agentPanel + "\n" + helpPanel
+
+	// Overlay toast notifications in the bottom-right
+	if len(m.toasts) > 0 && m.width > 0 && m.height > 0 {
+		toastBlock := m.renderToasts()
+		base = overlayBottomRight(base, toastBlock, m.width, m.height)
+	}
+
+	return base
 }
 
 // Key bindings
