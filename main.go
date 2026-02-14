@@ -752,31 +752,46 @@ func detectCodexStatus(target string) (AgentStatus, string) {
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
 
+	var lastLine string
+	if len(lastLines) > 0 {
+		lastLine = lastLines[len(lastLines)-1]
+	}
+
+	// Idle check first — the "›" prompt and bottom bar are definitive.
+	// Must check before running patterns because "• Ran" from previous
+	// tool executions persists in scrollback after Codex returns to idle.
+	isIdle := strings.Contains(lastLine, "›") ||
+		strings.Contains(recentContent, "? for shortcuts") ||
+		strings.Contains(recentContent, "context left")
+
 	// Running: active thinking/working with timing — "• Something (19s • esc to interrupt)"
 	if strings.Contains(recentContent, "esc to interrupt") {
 		return StatusRunning, truncate(activityLine, 60)
 	}
-	// Running: tool execution lines — "• Ran ..." at line start
-	if regexp.MustCompile(`(?m)^• Ran\s+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
-	}
-	// Running: spinner or active work indicators
-	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
-	}
-	runningPatterns := []string{
-		"Working...", "Thinking...", "Generating...",
-		"Processing...", "Executing...",
-	}
-	for _, pat := range runningPatterns {
-		if strings.Contains(recentContent, pat) {
+
+	if !isIdle {
+		// Running: tool execution lines — "• Ran ..." at line start
+		if regexp.MustCompile(`(?m)^• Ran\s+`).MatchString(recentContent) {
 			return StatusRunning, truncate(activityLine, 60)
 		}
-	}
-	// Running: sandbox execution
-	if strings.Contains(recentContent, "Running command") ||
-		strings.Contains(recentContent, "Applying patch") {
-		return StatusRunning, truncate(activityLine, 60)
+		// Running: spinner or active work indicators
+		if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
+			return StatusRunning, truncate(activityLine, 60)
+		}
+		runningPatterns := []string{
+			"Working...", "Thinking...", "Generating...",
+			"Processing...", "Executing...",
+		}
+		for _, pat := range runningPatterns {
+			if strings.Contains(recentContent, pat) {
+				return StatusRunning, truncate(activityLine, 60)
+			}
+		}
+		// Running: sandbox execution
+		if strings.Contains(recentContent, "Running command") ||
+			strings.Contains(recentContent, "Applying patch") {
+			return StatusRunning, truncate(activityLine, 60)
+		}
 	}
 
 	// Waiting: permission / approval prompts
@@ -791,14 +806,7 @@ func detectCodexStatus(target string) (AgentStatus, string) {
 		}
 	}
 
-	// Idle: at prompt
-	var lastLine string
-	if len(lastLines) > 0 {
-		lastLine = lastLines[len(lastLines)-1]
-	}
-	if strings.Contains(lastLine, "›") ||
-		strings.Contains(recentContent, "? for shortcuts") ||
-		strings.Contains(recentContent, "context left") {
+	if isIdle {
 		return StatusIdle, truncate(activityLine, 60)
 	}
 
