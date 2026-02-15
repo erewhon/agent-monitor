@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -49,6 +50,15 @@ const (
 	StatusWaiting              // Waiting for user input
 	StatusIdle                 // Idle/ready for input
 	StatusError                // Error state
+)
+
+// AgentPresence indicates whether the agent is real or a placeholder
+type AgentPresence int
+
+const (
+	PresenceActive    AgentPresence = iota // Agent detected and running
+	PresenceNoAgent                        // Tmux session exists, no agent process
+	PresenceNoSession                      // Session defined in config but not running
 )
 
 func (s AgentStatus) String() string {
@@ -125,7 +135,8 @@ type Agent struct {
 	Pane      int    // tmux pane index
 	Type      AgentType
 	Status    AgentStatus
-	LastLine  string // Last line of output (for status detection)
+	Presence  AgentPresence // Active, NoAgent (session exists), or NoSession
+	LastLine  string        // Last line of output (for status detection)
 	UpdatedAt time.Time
 }
 
@@ -180,6 +191,54 @@ func loadConfig() Config {
 	return cfg
 }
 
+// favoritesPath returns the path to the favorites file.
+func favoritesPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agent-monitor", "favorites.json")
+}
+
+// loadFavorites reads favorited session names from disk.
+func loadFavorites() map[string]bool {
+	path := favoritesPath()
+	if path == "" {
+		return make(map[string]bool)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return make(map[string]bool)
+	}
+	var names []string
+	if err := json.Unmarshal(data, &names); err != nil {
+		return make(map[string]bool)
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// saveFavorites writes favorited session names to disk.
+func saveFavorites(favs map[string]bool) {
+	path := favoritesPath()
+	if path == "" {
+		return
+	}
+	var names []string
+	for n := range favs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	data, err := json.Marshal(names)
+	if err != nil {
+		return
+	}
+	os.WriteFile(path, data, 0644)
+}
+
 // Spinner frames for running agents
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -222,9 +281,11 @@ type Model struct {
 	spinnerActive bool     // Whether a spinner tick chain is running
 	showActivity   bool     // Toggle: show last activity line under each agent
 	lastActiveAt   map[string]time.Time // session -> when last seen in an active state
-	filterGroups        map[string]bool      // If non-nil, only show these group names
+	filterGroups        map[string]bool        // If non-nil, only show these group names
 	previousStatus      map[string]AgentStatus // session -> last known status (for transition detection)
 	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
+	favorites           map[string]bool        // session name -> is favorite
+	filterFavorites     bool                   // when true, only show favorited agents
 }
 
 // Messages
@@ -295,6 +356,16 @@ var (
 
 	// "Other" group gets a dimmer blue-gray
 	otherGroupColor = lipgloss.Color("#6677aa")
+
+	// Phantom session styles
+	phantomNoAgentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243")) // medium gray — session running, no agent
+
+	phantomNoSessionStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("237")) // dark gray — session not running
+
+	favoriteStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("220")) // yellow star
 )
 
 func initialModel() Model {
@@ -306,6 +377,7 @@ func initialModel() Model {
 		lastActiveAt:        make(map[string]time.Time),
 		previousStatus:      make(map[string]AgentStatus),
 		planPendingApproval: make(map[string]bool),
+		favorites:           loadFavorites(),
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -366,14 +438,26 @@ func flattenItems(items []GroupItem) []Agent {
 
 // buildGroups maps agents into config-defined groups and computes flatAgents.
 func (m *Model) buildGroups() {
+	// Apply favorites filter if active
+	agents := m.agents
+	if m.filterFavorites {
+		var filtered []Agent
+		for _, a := range agents {
+			if m.favorites[a.Session] {
+				filtered = append(filtered, a)
+			}
+		}
+		agents = filtered
+	}
+
 	if len(m.config.Groups) == 0 {
 		// No config — flat list with sub-groups but no group headers
-		if len(m.agents) == 0 {
+		if len(agents) == 0 {
 			m.groups = nil
 			m.flatAgents = nil
 			return
 		}
-		items := computeItems(m.agents)
+		items := computeItems(agents)
 		m.groups = []Group{{Name: "", Items: items}}
 		m.flatAgents = flattenItems(items)
 		return
@@ -403,7 +487,7 @@ func (m *Model) buildGroups() {
 	// Bucket agents into groups
 	buckets := make([][]Agent, len(m.config.Groups))
 	var other []Agent
-	for _, agent := range m.agents {
+	for _, agent := range agents {
 		if idx, ok := exactMatch[agent.Session]; ok {
 			buckets[idx] = append(buckets[idx], agent)
 		} else {
@@ -1144,19 +1228,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, keys.Up):
-			if m.cursor > 0 {
-				m.cursor--
+			// Move up, skipping non-selectable (PresenceNoSession) entries
+			newCursor := m.cursor - 1
+			for newCursor >= 0 && m.flatAgents[newCursor].Presence == PresenceNoSession {
+				newCursor--
+			}
+			if newCursor >= 0 {
+				m.cursor = newCursor
 			}
 
 		case key.Matches(msg, keys.Down):
-			if m.cursor < len(m.flatAgents)-1 {
-				m.cursor++
+			// Move down, skipping non-selectable (PresenceNoSession) entries
+			newCursor := m.cursor + 1
+			for newCursor < len(m.flatAgents) && m.flatAgents[newCursor].Presence == PresenceNoSession {
+				newCursor++
+			}
+			if newCursor < len(m.flatAgents) {
+				m.cursor = newCursor
 			}
 
 		case key.Matches(msg, keys.Attach):
 			if len(m.flatAgents) > 0 && m.cursor < len(m.flatAgents) && !*noAttach {
 				agent := m.flatAgents[m.cursor]
-				return m, m.attachToAgent(agent)
+				if agent.Presence != PresenceNoSession {
+					return m, m.attachToAgent(agent)
+				}
 			}
 
 		case key.Matches(msg, keys.FocusRight):
@@ -1167,12 +1263,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, keys.ToggleActivity):
 			m.showActivity = !m.showActivity
+
+		case key.Matches(msg, keys.ToggleFavorite):
+			if len(m.flatAgents) > 0 && m.cursor < len(m.flatAgents) {
+				session := m.flatAgents[m.cursor].Session
+				if m.favorites[session] {
+					delete(m.favorites, session)
+				} else {
+					m.favorites[session] = true
+				}
+				saveFavorites(m.favorites)
+			}
+
+		case key.Matches(msg, keys.FilterFavorites):
+			m.filterFavorites = !m.filterFavorites
+			m.buildGroups()
+			if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
+				m.cursor = len(m.flatAgents) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
 		}
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			idx := m.mouseYToAgentIndex(msg.Y)
-			if idx >= 0 && idx < len(m.flatAgents) {
+			if idx >= 0 && idx < len(m.flatAgents) && m.flatAgents[idx].Presence != PresenceNoSession {
 				m.cursor = idx
 				// Immediately attach on click
 				if !*noAttach {
@@ -1250,10 +1367,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastActiveAt[a.Session] = time.Now()
 			}
 		}
+		// Inject phantom sessions from groups config
+		if len(m.config.Groups) > 0 {
+			m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
+		}
 		m.buildGroups()
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
 		}
+		// Ensure cursor is on a selectable entry
+		m.snapCursorToSelectable()
 		// Collect cmds: spinner + any toast display-message commands
 		var cmds []tea.Cmd
 		if !m.spinnerActive && len(m.agents) > 0 {
@@ -1287,6 +1410,30 @@ func (m Model) agentLineHeight(agent Agent) int {
 
 // mouseYToAgentIndex converts a mouse Y coordinate to a flatAgents index,
 // dynamically computing the offset by replaying the View layout.
+// snapCursorToSelectable ensures the cursor is on a selectable entry.
+func (m *Model) snapCursorToSelectable() {
+	if len(m.flatAgents) == 0 {
+		return
+	}
+	// Try current position first
+	if m.cursor < len(m.flatAgents) && m.flatAgents[m.cursor].Presence != PresenceNoSession {
+		return
+	}
+	// Search forward, then backward
+	for i := m.cursor; i < len(m.flatAgents); i++ {
+		if m.flatAgents[i].Presence != PresenceNoSession {
+			m.cursor = i
+			return
+		}
+	}
+	for i := m.cursor - 1; i >= 0; i-- {
+		if m.flatAgents[i].Presence != PresenceNoSession {
+			m.cursor = i
+			return
+		}
+	}
+}
+
 func (m Model) mouseYToAgentIndex(y int) int {
 	// Replay the layout to compute line positions:
 	// Y=0: panel top border
@@ -1430,6 +1577,32 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 // If displayName is non-empty, it is shown instead of agent.Name (for sub-grouped agents).
 // indent is prepended before the cursor/selection prefix (used for sub-group nesting).
 func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string, indent string) string {
+	// Favorite indicator
+	fav := " "
+	if m.favorites[agent.Session] {
+		fav = favoriteStyle.Render("★")
+	}
+
+	// Phantom agents: simplified rendering
+	if agent.Presence == PresenceNoSession {
+		name := agent.Name
+		if displayName != "" {
+			name = displayName
+		}
+		return phantomNoSessionStyle.Render(indent + "  " + fav + " · " + name)
+	}
+	if agent.Presence == PresenceNoAgent {
+		name := agent.Name
+		if displayName != "" {
+			name = displayName
+		}
+		if idx == m.cursor {
+			return selectedStyle.Render(indent + "> " + fav + " · " + name)
+		}
+		return indent + "  " + fav + " " + phantomNoAgentStyle.Render("· "+name)
+	}
+
+	// Active agent rendering
 	symbol := m.renderStatusSymbol(agent)
 
 	name := agent.Name
@@ -1448,7 +1621,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	}
 
 	badge := agent.Type.BadgeStyle().Render(agent.Type.Badge())
-	line := fmt.Sprintf("%s %s %s%s", symbol, badge, name, suffix)
+	line := fmt.Sprintf("%s %s %s %s%s", fav, symbol, badge, name, suffix)
 
 	if idx == m.cursor {
 		line = selectedStyle.Render(indent + "> " + line)
@@ -1504,6 +1677,9 @@ func (m Model) renderGradientTitle(text string) string {
 func (m Model) renderStatusSummary() string {
 	var running, planning, waiting, idle, recentIdle, errCount int
 	for _, a := range m.flatAgents {
+		if a.Presence != PresenceActive {
+			continue
+		}
 		switch a.Status {
 		case StatusRunning:
 			running++
@@ -1566,7 +1742,11 @@ func (m Model) View() string {
 	var content strings.Builder
 
 	// Gradient title
-	content.WriteString(m.renderGradientTitle(" Agent Monitor "))
+	title := " Agent Monitor "
+	if m.filterFavorites {
+		title = " ★ Favorites "
+	}
+	content.WriteString(m.renderGradientTitle(title))
 	content.WriteString("\n\n")
 
 	if len(m.flatAgents) == 0 {
@@ -1634,7 +1814,7 @@ func (m Model) View() string {
 	agentPanel := panelStyle.Width(panelWidth).Render(content.String())
 
 	// Help bar with its own border
-	helpKeys := "j/k:nav  ⏎:attach  l:focus  a:activity  r:refresh  q:quit"
+	helpKeys := "j/k:nav  ⏎:attach  l:focus  ␣:fav  f:filter  a:activity  q:quit"
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
@@ -1643,13 +1823,15 @@ func (m Model) View() string {
 
 // Key bindings
 type keyMap struct {
-	Up             key.Binding
-	Down           key.Binding
-	Attach         key.Binding
-	FocusRight     key.Binding
-	Refresh        key.Binding
-	ToggleActivity key.Binding
-	Quit           key.Binding
+	Up              key.Binding
+	Down            key.Binding
+	Attach          key.Binding
+	FocusRight      key.Binding
+	Refresh         key.Binding
+	ToggleActivity  key.Binding
+	ToggleFavorite  key.Binding
+	FilterFavorites key.Binding
+	Quit            key.Binding
 }
 
 var keys = keyMap{
@@ -1670,6 +1852,12 @@ var keys = keyMap{
 	),
 	ToggleActivity: key.NewBinding(
 		key.WithKeys("a"),
+	),
+	ToggleFavorite: key.NewBinding(
+		key.WithKeys(" "),
+	),
+	FilterFavorites: key.NewBinding(
+		key.WithKeys("f"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -1714,4 +1902,65 @@ func detectAgentsSync() []Agent {
 		return []Agent(agents)
 	}
 	return nil
+}
+
+// detectPhantomSessions returns placeholder agents for sessions defined in
+// groups.yaml that don't have a detected agent. Sessions with a running tmux
+// session get PresenceNoAgent (selectable); others get PresenceNoSession.
+func detectPhantomSessions(config Config, realAgents []Agent) []Agent {
+	// Get all tmux sessions
+	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}")
+	output, _ := cmd.Output()
+	tmuxSessions := make(map[string]bool)
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			tmuxSessions[line] = true
+		}
+	}
+
+	// Sessions that already have agents
+	agentSessions := make(map[string]bool)
+	for _, a := range realAgents {
+		agentSessions[a.Session] = true
+	}
+
+	var phantoms []Agent
+	for _, gc := range config.Groups {
+		for _, s := range gc.Sessions {
+			if strings.HasSuffix(s, "/*") {
+				// Wildcard: check all tmux sessions matching the prefix
+				prefix := strings.TrimSuffix(s, "/*")
+				for sessionName := range tmuxSessions {
+					if strings.HasPrefix(sessionName, prefix+"/") && !agentSessions[sessionName] {
+						phantoms = append(phantoms, Agent{
+							Name:     sessionName,
+							Session:  sessionName,
+							Type:     AgentUnknown,
+							Status:   StatusUnknown,
+							Presence: PresenceNoAgent,
+						})
+						agentSessions[sessionName] = true
+					}
+				}
+			} else {
+				if agentSessions[s] {
+					continue
+				}
+				presence := PresenceNoSession
+				if tmuxSessions[s] {
+					presence = PresenceNoAgent
+				}
+				phantoms = append(phantoms, Agent{
+					Name:     s,
+					Session:  s,
+					Type:     AgentUnknown,
+					Status:   StatusUnknown,
+					Presence: presence,
+				})
+				agentSessions[s] = true
+			}
+		}
+	}
+	return phantoms
 }

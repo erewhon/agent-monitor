@@ -10,7 +10,7 @@
 # - Right pane: attached view of selected agent
 #
 # The outer tmux uses a different socket (-L agent-monitor) and
-# prefix (C-a) to avoid conflicts with your regular tmux sessions.
+# prefix (C-\) to avoid conflicts with your regular tmux sessions and Emacs.
 
 set -e
 
