@@ -1583,10 +1583,10 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 // If displayName is non-empty, it is shown instead of agent.Name (for sub-grouped agents).
 // indent is prepended before the cursor/selection prefix (used for sub-group nesting).
 func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string, indent string) string {
-	// Favorite indicator
-	fav := " "
+	// Favorite indicator (trailing)
+	favSuffix := ""
 	if m.favorites[agent.Session] {
-		fav = favoriteStyle.Render("★")
+		favSuffix = " " + favoriteStyle.Render("★")
 	}
 
 	// Phantom agents: use "·" in place of status symbol, "  " for missing badge
@@ -1595,7 +1595,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 		if displayName != "" {
 			name = displayName
 		}
-		return phantomNoSessionStyle.Render(indent + "  " + fav + " ·    " + name)
+		return phantomNoSessionStyle.Render(indent + "  ·    " + name + favSuffix)
 	}
 	if agent.Presence == PresenceNoAgent {
 		name := agent.Name
@@ -1603,9 +1603,9 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 			name = displayName
 		}
 		if idx == m.cursor {
-			return selectedStyle.Render(indent + "> " + fav + " ·    " + name)
+			return selectedStyle.Render(indent + "> ·    " + name + favSuffix)
 		}
-		return indent + "  " + fav + " " + phantomNoAgentStyle.Render("·    "+name)
+		return indent + "  " + phantomNoAgentStyle.Render("·    "+name) + favSuffix
 	}
 
 	// Active agent rendering
@@ -1627,7 +1627,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	}
 
 	badge := agent.Type.BadgeStyle().Render(agent.Type.Badge())
-	line := fmt.Sprintf("%s %s %s %s%s", fav, symbol, badge, name, suffix)
+	line := fmt.Sprintf("%s %s %s%s%s", symbol, badge, name, suffix, favSuffix)
 
 	if idx == m.cursor {
 		line = selectedStyle.Render(indent + "> " + line)
