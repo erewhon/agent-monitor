@@ -1493,9 +1493,15 @@ func (m Model) attachToAgent(agent Agent) tea.Cmd {
 	return func() tea.Msg {
 		target := agent.Target()
 
+		// For phantom sessions (no agent), attach to the session itself
+		attachTarget := target
+		if agent.Presence == PresenceNoAgent {
+			attachTarget = agent.Session
+		}
+
 		// Use respawn-pane to kill whatever is running and start fresh with the attach command
 		// This cleanly handles: placeholder, attached tmux session, or anything else
-		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", target)
+		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", attachTarget)
 		exec.Command("tmux", "-L", m.outerSocket, "respawn-pane", "-k", "-t", "0.1", attachCmd).Run()
 
 		// Focus the right pane
@@ -1583,13 +1589,13 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 		fav = favoriteStyle.Render("★")
 	}
 
-	// Phantom agents: simplified rendering
+	// Phantom agents: use "·" in place of status symbol, "  " for missing badge
 	if agent.Presence == PresenceNoSession {
 		name := agent.Name
 		if displayName != "" {
 			name = displayName
 		}
-		return phantomNoSessionStyle.Render(indent + "  " + fav + " · " + name)
+		return phantomNoSessionStyle.Render(indent + "  " + fav + " ·    " + name)
 	}
 	if agent.Presence == PresenceNoAgent {
 		name := agent.Name
@@ -1597,9 +1603,9 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 			name = displayName
 		}
 		if idx == m.cursor {
-			return selectedStyle.Render(indent + "> " + fav + " · " + name)
+			return selectedStyle.Render(indent + "> " + fav + " ·    " + name)
 		}
-		return indent + "  " + fav + " " + phantomNoAgentStyle.Render("· "+name)
+		return indent + "  " + fav + " " + phantomNoAgentStyle.Render("·    "+name)
 	}
 
 	// Active agent rendering
