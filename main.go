@@ -21,10 +21,11 @@ import (
 var version = "dev"
 
 var (
-	listOnly    = flag.Bool("list", false, "List agents and exit (no TUI)")
-	outerSocket = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
-	noAttach    = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
-	groupsFlag  = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
+	listOnly          = flag.Bool("list", false, "List agents and exit (no TUI)")
+	outerSocket       = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
+	noAttach          = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
+	groupsFlag        = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
+	autoApprovePlans  = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -221,8 +222,9 @@ type Model struct {
 	spinnerActive bool     // Whether a spinner tick chain is running
 	showActivity   bool     // Toggle: show last activity line under each agent
 	lastActiveAt   map[string]time.Time // session -> when last seen in an active state
-	filterGroups   map[string]bool      // If non-nil, only show these group names
-	previousStatus map[string]AgentStatus // session -> last known status (for transition detection)
+	filterGroups        map[string]bool      // If non-nil, only show these group names
+	previousStatus      map[string]AgentStatus // session -> last known status (for transition detection)
+	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
 }
 
 // Messages
@@ -297,12 +299,13 @@ var (
 
 func initialModel() Model {
 	m := Model{
-		agents:         []Agent{},
-		cursor:         0,
-		outerSocket:    *outerSocket,
-		config:         loadConfig(),
-		lastActiveAt:   make(map[string]time.Time),
-		previousStatus: make(map[string]AgentStatus),
+		agents:              []Agent{},
+		cursor:              0,
+		outerSocket:         *outerSocket,
+		config:              loadConfig(),
+		lastActiveAt:        make(map[string]time.Time),
+		previousStatus:      make(map[string]AgentStatus),
+		planPendingApproval: make(map[string]bool),
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -1221,6 +1224,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			newStatus[a.Session] = a.Status
 		}
 		m.previousStatus = newStatus
+		// Auto-approve plan mode exits for Claude agents
+		if *autoApprovePlans {
+			for _, a := range m.agents {
+				if a.Type != AgentClaude {
+					continue
+				}
+				if a.Status == StatusPlanning {
+					m.planPendingApproval[a.Session] = true
+				} else if m.planPendingApproval[a.Session] {
+					if a.Status == StatusIdle || a.Status == StatusWaiting {
+						delete(m.planPendingApproval, a.Session)
+						toastCmds = append(toastCmds, sendPlanApproval(a, m.outerSocket))
+					} else if a.Status != StatusRunning {
+						// Clear for error/unknown — Running preserves the flag
+						// because ExitPlanMode response may still be rendering
+						delete(m.planPendingApproval, a.Session)
+					}
+				}
+			}
+		}
 		// Track when agents are active for "recently idle" indicator
 		for _, a := range m.agents {
 			if a.Status == StatusRunning || a.Status == StatusPlanning || a.Status == StatusWaiting {
@@ -1345,6 +1368,25 @@ func (m Model) tmuxDisplayToast(toast Toast) tea.Cmd {
 		}
 		exec.Command("tmux", "-L", m.outerSocket,
 			"display-message", "-d", "6000", msg).Run()
+		return nil
+	}
+}
+
+// sendPlanApproval sends keystrokes to approve a plan exit and notifies via outer tmux.
+func sendPlanApproval(agent Agent, outerSocket string) tea.Cmd {
+	return func() tea.Msg {
+		target := agent.Target()
+		if agent.Status == StatusIdle {
+			// At the ⏵⏵ prompt — type "yes" to approve the plan
+			exec.Command("tmux", "send-keys", "-t", target, "yes", "Enter").Run()
+		} else {
+			// At an approval prompt — press Enter to accept default
+			exec.Command("tmux", "send-keys", "-t", target, "Enter").Run()
+		}
+		if outerSocket != "" {
+			msg := fmt.Sprintf("[%s] %s — auto-approved plan", agent.Type.Badge(), agent.Name)
+			exec.Command("tmux", "-L", outerSocket, "display-message", "-d", "4000", msg).Run()
+		}
 		return nil
 	}
 }
