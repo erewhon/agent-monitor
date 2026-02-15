@@ -286,6 +286,7 @@ type Model struct {
 	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
 	favorites           map[string]bool        // session name -> is favorite
 	filterFavorites     bool                   // when true, only show favorited agents
+	scrollOffset        int                    // viewport scroll offset for agent list
 }
 
 // Messages
@@ -1235,6 +1236,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if newCursor >= 0 {
 				m.cursor = newCursor
+				m.ensureCursorVisible()
 			}
 
 		case key.Matches(msg, keys.Down):
@@ -1245,6 +1247,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if newCursor < len(m.flatAgents) {
 				m.cursor = newCursor
+				m.ensureCursorVisible()
 			}
 
 		case key.Matches(msg, keys.Attach):
@@ -1263,6 +1266,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, keys.ToggleActivity):
 			m.showActivity = !m.showActivity
+			m.ensureCursorVisible()
 
 		case key.Matches(msg, keys.ToggleFavorite):
 			if len(m.flatAgents) > 0 && m.cursor < len(m.flatAgents) {
@@ -1277,6 +1281,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, keys.FilterFavorites):
 			m.filterFavorites = !m.filterFavorites
+			m.scrollOffset = 0
 			m.buildGroups()
 			if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 				m.cursor = len(m.flatAgents) - 1
@@ -1284,6 +1289,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < 0 {
 				m.cursor = 0
 			}
+			m.ensureCursorVisible()
 		}
 
 	case tea.MouseMsg:
@@ -1377,6 +1383,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Ensure cursor is on a selectable entry
 		m.snapCursorToSelectable()
+		m.ensureCursorVisible()
 		// Collect cmds: spinner + any toast display-message commands
 		var cmds []tea.Cmd
 		if !m.spinnerActive && len(m.agents) > 0 {
@@ -1410,6 +1417,64 @@ func (m Model) agentLineHeight(agent Agent) int {
 
 // mouseYToAgentIndex converts a mouse Y coordinate to a flatAgents index,
 // dynamically computing the offset by replaying the View layout.
+// ensureCursorVisible adjusts scrollOffset so the cursor is within the viewport.
+// cursorLine is computed by walking the display structure to find the line
+// corresponding to m.cursor in the agent list.
+func (m *Model) ensureCursorVisible() {
+	// Compute which line the cursor agent occupies
+	line := 0
+	agentIdx := 0
+	for _, g := range m.groups {
+		if g.Name != "" {
+			line++ // group header
+		}
+		for _, item := range g.Items {
+			if item.IsSubGroup {
+				line++ // sub-group header
+				for _, agent := range item.SubGroup.Agents {
+					if agentIdx == m.cursor {
+						goto found
+					}
+					line++ // agent line
+					if m.showActivity && agent.LastLine != "" {
+						line++ // activity line
+					}
+					agentIdx++
+				}
+			} else {
+				if agentIdx == m.cursor {
+					goto found
+				}
+				line++
+				if m.showActivity && item.Agent.LastLine != "" {
+					line++
+				}
+				agentIdx++
+			}
+		}
+	}
+found:
+	// Available height for list (same calc as View)
+	overhead := 7 // title(1) + blank(1) + borders(2) + help(3)
+	if m.scrollOffset > 0 {
+		overhead++ // "↑ more" line
+	}
+	availHeight := m.height - overhead
+	if availHeight < 3 {
+		availHeight = 3
+	}
+
+	if line < m.scrollOffset {
+		m.scrollOffset = line
+	}
+	if line >= m.scrollOffset+availHeight {
+		m.scrollOffset = line - availHeight + 1
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+}
+
 // snapCursorToSelectable ensures the cursor is on a selectable entry.
 func (m *Model) snapCursorToSelectable() {
 	if len(m.flatAgents) == 0 {
@@ -1745,19 +1810,21 @@ func (m Model) View() string {
 	// Add space for " ◀" attached indicator
 	maxNameLen += 3
 
-	var content strings.Builder
+	var header strings.Builder
 
 	// Gradient title
 	title := " Agent Monitor "
 	if m.filterFavorites {
 		title = " ★ Favorites "
 	}
-	content.WriteString(m.renderGradientTitle(title))
-	content.WriteString("\n\n")
+	header.WriteString(m.renderGradientTitle(title))
+	header.WriteString("\n\n")
 
+	// Build agent list lines
+	var listLines []string
 	if len(m.flatAgents) == 0 {
-		content.WriteString(normalStyle.Render("No agents found.\n"))
-		content.WriteString(dimStyle.Render("Start an agent in tmux.\n"))
+		listLines = append(listLines, normalStyle.Render("No agents found."))
+		listLines = append(listLines, dimStyle.Render("Start an agent in tmux."))
 	} else {
 		agentIdx := 0
 		for gi, g := range m.groups {
@@ -1769,48 +1836,76 @@ func (m Model) View() string {
 				} else {
 					headerColor = groupHeaderColors[gi%len(groupHeaderColors)]
 				}
-				headerStyle := lipgloss.NewStyle().
+				hdrStyle := lipgloss.NewStyle().
 					Bold(true).
 					Foreground(headerColor)
-				content.WriteString(headerStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
-				content.WriteString("\n")
+				listLines = append(listLines, hdrStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
 			}
 
 			for _, item := range g.Items {
 				if item.IsSubGroup {
 					// Sub-group header
-					content.WriteString(dimStyle.Render(fmt.Sprintf("  ├ %s", item.SubGroup.Prefix)))
-					content.WriteString("\n")
+					listLines = append(listLines, dimStyle.Render(fmt.Sprintf("  ├ %s", item.SubGroup.Prefix)))
 					for _, agent := range item.SubGroup.Agents {
-						// Show only the suffix after the slash
 						suffix := agent.Name[len(item.SubGroup.Prefix)+1:]
-						content.WriteString(m.renderAgentLine(agent, agentIdx, maxNameLen, suffix, "  "))
-						content.WriteString("\n")
+						rendered := m.renderAgentLine(agent, agentIdx, maxNameLen, suffix, "  ")
+						for _, rl := range strings.Split(rendered, "\n") {
+							listLines = append(listLines, rl)
+						}
 						agentIdx++
 					}
 				} else {
-					content.WriteString(m.renderAgentLine(item.Agent, agentIdx, maxNameLen, "", ""))
-					content.WriteString("\n")
+					rendered := m.renderAgentLine(item.Agent, agentIdx, maxNameLen, "", "")
+					for _, rl := range strings.Split(rendered, "\n") {
+						listLines = append(listLines, rl)
+					}
 					agentIdx++
 				}
 			}
 		}
 	}
 
-	// Status summary at the bottom of the agent list
+	// Status summary
+	var footer strings.Builder
 	if len(m.flatAgents) > 0 {
 		summary := m.renderStatusSummary()
 		if summary != "" {
-			content.WriteString(dimStyle.Render("─") + " " + summary)
-			content.WriteString("\n")
+			footer.WriteString(dimStyle.Render("─") + " " + summary + "\n")
 		}
 	}
-
-	// Error line
 	if m.err != nil {
-		content.WriteString("\n")
-		content.WriteString(statusError.Render(fmt.Sprintf("Error: %v", m.err)))
+		footer.WriteString(statusError.Render(fmt.Sprintf("Error: %v", m.err)) + "\n")
 	}
+
+	// Compute available height for the agent list
+	overhead := 7 // title(1) + blank(1) + borders(2) + help(3)
+	if m.scrollOffset > 0 {
+		overhead++ // "↑ more" line
+	}
+	availHeight := m.height - overhead
+	if availHeight < 3 {
+		availHeight = 3
+	}
+
+	// Slice the visible window
+	endLine := m.scrollOffset + availHeight
+	if endLine > len(listLines) {
+		endLine = len(listLines)
+	}
+	visibleLines := listLines[m.scrollOffset:endLine]
+
+	// Assemble panel content
+	var content strings.Builder
+	content.WriteString(header.String())
+	if m.scrollOffset > 0 {
+		content.WriteString(dimStyle.Render("  ↑ more") + "\n")
+	}
+	content.WriteString(strings.Join(visibleLines, "\n"))
+	content.WriteString("\n")
+	if endLine < len(listLines) {
+		content.WriteString(dimStyle.Render("  ↓ more") + "\n")
+	}
+	content.WriteString(footer.String())
 
 	// Apply panel border to agent list
 	panelWidth := m.width - 2 // account for border
