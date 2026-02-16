@@ -1148,8 +1148,9 @@ func detectClaudeStatus(target string) (AgentStatus, string) {
 		}
 	}
 
-	// Plan mode: agent is exploring/designing
-	if strings.Contains(recentContent, "plan mode") {
+	// Plan mode: agent is exploring/designing.
+	// Line-start-anchored to avoid matching "plan mode" in conversation text.
+	if regexp.MustCompile(`(?m)^\s*plan mode`).MatchString(recentContent) {
 		return StatusPlanning, truncate(activityLine, 60)
 	}
 
