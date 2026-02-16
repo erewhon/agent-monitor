@@ -1,0 +1,74 @@
+#!/bin/sh
+# agent-monitor-stats — system stats for the outer tmux status bar
+# Output: sparkline + load │ RAM bar % │ / bar %
+
+HISTORY_FILE="/tmp/agent-monitor-load-history"
+SPARK_CHARS="▁▂▃▄▅▆▇█"
+BAR_LEN=6
+
+# --- CPU load ---
+load=$(awk '{print $1}' /proc/loadavg)
+ncpu=$(nproc)
+
+# Append load to history, keep last 10
+echo "$load" >> "$HISTORY_FILE"
+tail -n 10 "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
+mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+
+# Determine sparkline scale: max of (readings, ncpu)
+max=$ncpu
+while IFS= read -r val; do
+    if awk "BEGIN{exit(!($val > $max))}"; then
+        max=$val
+    fi
+done < "$HISTORY_FILE"
+# Avoid division by zero
+if awk "BEGIN{exit(!($max == 0))}"; then
+    max=1
+fi
+
+# Build sparkline — lookup table for multi-byte chars
+spark_char() {
+    case $1 in
+        0) printf '▁';; 1) printf '▂';; 2) printf '▃';; 3) printf '▄';;
+        4) printf '▅';; 5) printf '▆';; 6) printf '▇';; 7) printf '█';;
+    esac
+}
+
+spark=""
+while IFS= read -r val; do
+    idx=$(awk "BEGIN{i=int($val/$max*7); if(i>7)i=7; print i}")
+    spark="${spark}$(spark_char "$idx")"
+done < "$HISTORY_FILE"
+
+# --- RAM ---
+mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+
+# --- Disk ---
+disk_pct=$(df / | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+
+# --- Render bar gauge ---
+bar_gauge() {
+    pct=$1
+    filled=$(( pct * BAR_LEN / 100 ))
+    empty=$(( BAR_LEN - filled ))
+    bar=""
+    i=0; while [ $i -lt $filled ]; do bar="${bar}█"; i=$((i+1)); done
+    i=0; while [ $i -lt $empty ];  do bar="${bar}░"; i=$((i+1)); done
+    echo "$bar"
+}
+
+ram_bar=$(bar_gauge "$mem_pct")
+disk_bar=$(bar_gauge "$disk_pct")
+
+# --- Output with tmux color codes ---
+printf "%s" \
+    "#[fg=#b388ff]${spark} ${load}" \
+    " #[fg=#6677aa]│" \
+    " #[fg=#6677aa]RAM #[fg=#9933ff]${ram_bar}" \
+    " #[fg=#b84dff]${mem_pct}%%" \
+    " #[fg=#6677aa]│" \
+    " #[fg=#6677aa]/ #[fg=#9933ff]${disk_bar}" \
+    " #[fg=#b84dff]${disk_pct}%%"
