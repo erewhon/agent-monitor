@@ -30,7 +30,7 @@ var (
 	noAttach          = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
 	groupsFlag        = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
 	autoApprovePlans  = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
-	notifyOSC         = flag.Bool("notify", false, "Enable OSC 9 terminal notifications (passthrough to terminal emulator)")
+	notifyOSC         = flag.Bool("notify", true, "Enable OSC 777 terminal notifications (passthrough to terminal emulator)")
 	ntfyTopic         = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
 	ntfyServer        = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
 	notifyCmd         = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
