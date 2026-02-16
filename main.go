@@ -305,36 +305,37 @@ func (n Notification) Body() string {
 	return string(n.Event)
 }
 
-// sendOSC9Notification writes an OSC 9 escape sequence to the outer tmux
-// client's PTY so it passes through to the terminal emulator (e.g. Ghostty).
-func sendOSC9Notification(n Notification, outerSocket string) tea.Cmd {
+// sendOSCNotification writes an OSC 777 escape sequence that reaches the
+// terminal emulator (e.g. Ghostty) through nested tmux layers.
+// It wraps the OSC in a DCS tmux passthrough so the inner tmux (default socket)
+// forwards it to the real terminal. Requires allow-passthrough on.
+func sendOSCNotification(n Notification, outerSocket string) tea.Cmd {
 	return func() tea.Msg {
-		msg := n.Title()
-		if n.Message != "" {
-			msg += " — " + truncate(n.Message, 40)
-		}
-		seq := fmt.Sprintf("\033]9;%s\007", msg)
+		osc := fmt.Sprintf("\033]777;notify;%s;%s\007", n.Title(), n.Body())
+		// DCS passthrough: double each ESC in the payload
+		dcs := "\033Ptmux;" + strings.ReplaceAll(osc, "\033", "\033\033") + "\033\\"
 
-		// Try to find the outer tmux client's PTY
+		// Write DCS-wrapped sequence to the outer tmux client's PTY.
+		// That PTY is a pane in the inner tmux, which (with allow-passthrough on)
+		// unwraps the DCS and forwards the raw OSC 777 to the real terminal.
 		if outerSocket != "" {
 			cmd := exec.Command("tmux", "-L", outerSocket, "list-clients", "-F", "#{client_tty}")
 			out, err := cmd.Output()
 			if err == nil {
 				tty := strings.TrimSpace(string(out))
 				if tty != "" {
-					// Take the first client line
 					tty = strings.SplitN(tty, "\n", 2)[0]
 					if f, err := os.OpenFile(tty, os.O_WRONLY, 0); err == nil {
-						f.WriteString(seq)
+						f.WriteString(dcs)
 						f.Close()
 						return nil
 					}
 				}
 			}
 		}
-		// Fallback: write to /dev/tty
+		// Fallback: write raw OSC to /dev/tty (no tmux nesting)
 		if f, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
-			f.WriteString(seq)
+			f.WriteString(osc)
 			f.Close()
 		}
 		return nil
@@ -389,7 +390,7 @@ func sendCmdNotification(n Notification, cmdStr string) tea.Cmd {
 func dispatchNotification(n Notification, outerSocket string) []tea.Cmd {
 	var cmds []tea.Cmd
 	if *notifyOSC {
-		cmds = append(cmds, sendOSC9Notification(n, outerSocket))
+		cmds = append(cmds, sendOSCNotification(n, outerSocket))
 	}
 	if *ntfyTopic != "" {
 		cmds = append(cmds, sendNtfyNotification(n, *ntfyServer, *ntfyTopic))
