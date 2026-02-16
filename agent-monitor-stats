@@ -15,8 +15,9 @@ echo "$load" >> "$HISTORY_FILE"
 tail -n 10 "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
 mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
 
-# Determine sparkline scale: max of (readings, ncpu)
-max=$ncpu
+# Determine sparkline scale: max of (readings, ncpu/8, floor 4)
+# Use ncpu/8 (min 4) as baseline so typical loads show visual variation
+max=$(awk "BEGIN{v=$ncpu/8; print (v<4)?4:v}")
 while IFS= read -r val; do
     if awk "BEGIN{exit(!($val > $max))}"; then
         max=$val
@@ -68,7 +69,7 @@ printf "%s" \
     "#[fg=#b388ff]${spark} ${load}" \
     " #[fg=#6677aa]│" \
     " #[fg=#6677aa]RAM #[fg=#9933ff]${ram_bar}" \
-    " #[fg=#b84dff]${mem_pct}%%" \
+    " #[fg=#b84dff]${mem_pct}%" \
     " #[fg=#6677aa]│" \
     " #[fg=#6677aa]/ #[fg=#9933ff]${disk_bar}" \
-    " #[fg=#b84dff]${disk_pct}%%"
+    " #[fg=#b84dff]${disk_pct}%"
