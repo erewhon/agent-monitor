@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +30,10 @@ var (
 	noAttach          = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
 	groupsFlag        = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
 	autoApprovePlans  = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
+	notifyOSC         = flag.Bool("notify", false, "Enable OSC 9 terminal notifications (passthrough to terminal emulator)")
+	ntfyTopic         = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
+	ntfyServer        = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
+	notifyCmd         = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -262,6 +269,135 @@ type Toast struct {
 	AgentName string
 	Message   string
 	Badge     string
+}
+
+// NotifyEvent identifies what triggered a desktop notification.
+type NotifyEvent string
+
+const (
+	NotifyWaiting  NotifyEvent = "waiting"
+	NotifyFinished NotifyEvent = "finished"
+)
+
+// Notification carries the data needed by all notification backends.
+type Notification struct {
+	AgentName string
+	Badge     string
+	Event     NotifyEvent
+	Message   string
+}
+
+func (n Notification) Title() string {
+	switch n.Event {
+	case NotifyWaiting:
+		return fmt.Sprintf("[%s] %s needs input", n.Badge, n.AgentName)
+	case NotifyFinished:
+		return fmt.Sprintf("[%s] %s finished", n.Badge, n.AgentName)
+	default:
+		return fmt.Sprintf("[%s] %s", n.Badge, n.AgentName)
+	}
+}
+
+func (n Notification) Body() string {
+	if n.Message != "" {
+		return truncate(n.Message, 80)
+	}
+	return string(n.Event)
+}
+
+// sendOSC9Notification writes an OSC 9 escape sequence to the outer tmux
+// client's PTY so it passes through to the terminal emulator (e.g. Ghostty).
+func sendOSC9Notification(n Notification, outerSocket string) tea.Cmd {
+	return func() tea.Msg {
+		msg := n.Title()
+		if n.Message != "" {
+			msg += " — " + truncate(n.Message, 40)
+		}
+		seq := fmt.Sprintf("\033]9;%s\007", msg)
+
+		// Try to find the outer tmux client's PTY
+		if outerSocket != "" {
+			cmd := exec.Command("tmux", "-L", outerSocket, "list-clients", "-F", "#{client_tty}")
+			out, err := cmd.Output()
+			if err == nil {
+				tty := strings.TrimSpace(string(out))
+				if tty != "" {
+					// Take the first client line
+					tty = strings.SplitN(tty, "\n", 2)[0]
+					if f, err := os.OpenFile(tty, os.O_WRONLY, 0); err == nil {
+						f.WriteString(seq)
+						f.Close()
+						return nil
+					}
+				}
+			}
+		}
+		// Fallback: write to /dev/tty
+		if f, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+			f.WriteString(seq)
+			f.Close()
+		}
+		return nil
+	}
+}
+
+// sendNtfyNotification POSTs a notification to an ntfy server.
+func sendNtfyNotification(n Notification, server, topic string) tea.Cmd {
+	return func() tea.Msg {
+		url := strings.TrimRight(server, "/") + "/" + topic
+		body := bytes.NewBufferString(n.Body())
+		req, err := http.NewRequest("POST", url, body)
+		if err != nil {
+			return nil
+		}
+		req.Header.Set("Title", n.Title())
+		if n.Event == NotifyWaiting {
+			req.Header.Set("Priority", "high")
+			req.Header.Set("Tags", "warning")
+		} else {
+			req.Header.Set("Priority", "default")
+			req.Header.Set("Tags", "white_check_mark")
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return nil
+	}
+}
+
+// sendCmdNotification runs a user-provided command with notification env vars.
+func sendCmdNotification(n Notification, cmdStr string) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("sh", "-c", cmdStr)
+		cmd.Env = append(os.Environ(),
+			"AGENT_MONITOR_AGENT="+n.AgentName,
+			"AGENT_MONITOR_BADGE="+n.Badge,
+			"AGENT_MONITOR_EVENT="+string(n.Event),
+			"AGENT_MONITOR_TITLE="+n.Title(),
+			"AGENT_MONITOR_MESSAGE="+n.Message,
+		)
+		cmd.Run()
+		return nil
+	}
+}
+
+// dispatchNotification fans out a notification to all enabled backends.
+func dispatchNotification(n Notification, outerSocket string) []tea.Cmd {
+	var cmds []tea.Cmd
+	if *notifyOSC {
+		cmds = append(cmds, sendOSC9Notification(n, outerSocket))
+	}
+	if *ntfyTopic != "" {
+		cmds = append(cmds, sendNtfyNotification(n, *ntfyServer, *ntfyTopic))
+	}
+	if *notifyCmd != "" {
+		cmds = append(cmds, sendCmdNotification(n, *notifyCmd))
+	}
+	return cmds
 }
 
 // Model is the Bubble Tea model
@@ -1322,15 +1458,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
-		// Detect transitions TO waiting and create toasts
+		// Detect transitions and create toasts + desktop notifications
 		var toastCmds []tea.Cmd
 		for _, a := range m.agents {
-			// Skip toast for the currently attached/focused agent
+			// Skip notifications for the currently attached/focused agent
 			if a.Target() == m.attached {
 				continue
 			}
 			prev, known := m.previousStatus[a.Session]
-			if known && prev != StatusWaiting && a.Status == StatusWaiting {
+			if !known {
+				continue
+			}
+			// Waiting transition: tmux toast + desktop notification
+			if prev != StatusWaiting && a.Status == StatusWaiting {
 				toast := Toast{
 					AgentName: a.Name,
 					Message:   a.LastLine,
@@ -1339,6 +1479,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.outerSocket != "" {
 					toastCmds = append(toastCmds, m.tmuxDisplayToast(toast))
 				}
+				toastCmds = append(toastCmds, dispatchNotification(Notification{
+					AgentName: a.Name,
+					Badge:     a.Type.Badge(),
+					Event:     NotifyWaiting,
+					Message:   a.LastLine,
+				}, m.outerSocket)...)
+			}
+			// Finished transition: running/planning → idle (desktop notification only)
+			if (prev == StatusRunning || prev == StatusPlanning) && a.Status == StatusIdle {
+				toastCmds = append(toastCmds, dispatchNotification(Notification{
+					AgentName: a.Name,
+					Badge:     a.Type.Badge(),
+					Event:     NotifyFinished,
+					Message:   a.LastLine,
+				}, m.outerSocket)...)
 			}
 		}
 		// Rebuild previousStatus from current agents (cleans up stale entries)
