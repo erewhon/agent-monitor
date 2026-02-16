@@ -277,6 +277,7 @@ type NotifyEvent string
 const (
 	NotifyWaiting  NotifyEvent = "waiting"
 	NotifyFinished NotifyEvent = "finished"
+	NotifyPlanning NotifyEvent = "planning"
 )
 
 // Notification carries the data needed by all notification backends.
@@ -291,6 +292,8 @@ func (n Notification) Title() string {
 	switch n.Event {
 	case NotifyWaiting:
 		return fmt.Sprintf("[%s] %s needs input", n.Badge, n.AgentName)
+	case NotifyPlanning:
+		return fmt.Sprintf("[%s] %s needs plan approval", n.Badge, n.AgentName)
 	case NotifyFinished:
 		return fmt.Sprintf("[%s] %s finished", n.Badge, n.AgentName)
 	default:
@@ -1484,6 +1487,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					AgentName: a.Name,
 					Badge:     a.Type.Badge(),
 					Event:     NotifyWaiting,
+					Message:   a.LastLine,
+				}, m.outerSocket)...)
+			}
+			// Planning transition: agent enters plan mode, will need approval
+			if prev != StatusPlanning && a.Status == StatusPlanning {
+				toastCmds = append(toastCmds, dispatchNotification(Notification{
+					AgentName: a.Name,
+					Badge:     a.Type.Badge(),
+					Event:     NotifyPlanning,
 					Message:   a.LastLine,
 				}, m.outerSocket)...)
 			}
