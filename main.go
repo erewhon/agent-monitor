@@ -314,6 +314,7 @@ func (n Notification) Body() string {
 // forwards it to the real terminal. Requires allow-passthrough on.
 func sendOSCNotification(n Notification, outerSocket string) tea.Cmd {
 	return func() tea.Msg {
+		time.Sleep(500 * time.Millisecond)
 		osc := fmt.Sprintf("\033]777;notify;%s;%s\007", n.Title(), n.Body())
 		// DCS passthrough: double each ESC in the payload
 		dcs := "\033Ptmux;" + strings.ReplaceAll(osc, "\033", "\033\033") + "\033\\"
@@ -348,6 +349,7 @@ func sendOSCNotification(n Notification, outerSocket string) tea.Cmd {
 // sendNtfyNotification POSTs a notification to an ntfy server.
 func sendNtfyNotification(n Notification, server, topic string) tea.Cmd {
 	return func() tea.Msg {
+		time.Sleep(500 * time.Millisecond)
 		url := strings.TrimRight(server, "/") + "/" + topic
 		body := bytes.NewBufferString(n.Body())
 		req, err := http.NewRequest("POST", url, body)
@@ -376,6 +378,7 @@ func sendNtfyNotification(n Notification, server, topic string) tea.Cmd {
 // sendCmdNotification runs a user-provided command with notification env vars.
 func sendCmdNotification(n Notification, cmdStr string) tea.Cmd {
 	return func() tea.Msg {
+		time.Sleep(500 * time.Millisecond)
 		cmd := exec.Command("sh", "-c", cmdStr)
 		cmd.Env = append(os.Environ(),
 			"AGENT_MONITOR_AGENT="+n.AgentName,
@@ -1749,6 +1752,9 @@ func (m Model) attachToAgent(agent Agent) tea.Cmd {
 // notification is visible across both panes (even when the right pane has focus).
 func (m Model) tmuxDisplayToast(toast Toast) tea.Cmd {
 	return func() tea.Msg {
+		// Brief delay so the TUI View() render reaches the screen before
+		// the tmux display-message overlay appears.
+		time.Sleep(500 * time.Millisecond)
 		msg := fmt.Sprintf("[%s] %s needs input", toast.Badge, toast.AgentName)
 		if toast.Message != "" {
 			msg += " — " + truncate(toast.Message, 40)
@@ -1762,6 +1768,7 @@ func (m Model) tmuxDisplayToast(toast Toast) tea.Cmd {
 // sendPlanApproval sends keystrokes to approve a plan exit and notifies via outer tmux.
 func sendPlanApproval(agent Agent, outerSocket string) tea.Cmd {
 	return func() tea.Msg {
+		time.Sleep(500 * time.Millisecond)
 		target := agent.Target()
 		if agent.Status == StatusIdle {
 			// At the ⏵⏵ prompt — type "yes" to approve the plan
