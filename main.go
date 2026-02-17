@@ -426,6 +426,7 @@ type Model struct {
 	lastActiveAt   map[string]time.Time // session -> when last seen in an active state
 	filterGroups        map[string]bool        // If non-nil, only show these group names
 	previousStatus      map[string]AgentStatus // session -> last known status (for transition detection)
+	pendingTransition   map[string]AgentStatus // session -> status seen once but not yet confirmed (debounce)
 	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
 	favorites           map[string]bool        // session name -> is favorite
 	filterFavorites     bool                   // when true, only show favorited agents
@@ -520,6 +521,7 @@ func initialModel() Model {
 		config:              loadConfig(),
 		lastActiveAt:        make(map[string]time.Time),
 		previousStatus:      make(map[string]AgentStatus),
+		pendingTransition:   make(map[string]AgentStatus),
 		planPendingApproval: make(map[string]bool),
 		favorites:           loadFavorites(),
 	}
@@ -1466,8 +1468,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
-		// Detect transitions and create toasts + desktop notifications
+		// Detect transitions with debouncing: a status change must persist
+		// for 2 consecutive polls before triggering notifications. This
+		// prevents spurious alerts when detection briefly flickers (e.g.
+		// agent momentarily appears idle between tool calls).
 		var toastCmds []tea.Cmd
+		newPending := make(map[string]AgentStatus)
 		for _, a := range m.agents {
 			// Skip notifications for the currently attached/focused agent
 			if a.Target() == m.attached {
@@ -1477,46 +1483,70 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !known {
 				continue
 			}
-			// Waiting transition: tmux toast + desktop notification
-			if prev != StatusWaiting && a.Status == StatusWaiting {
-				toast := Toast{
-					AgentName: a.Name,
-					Message:   a.LastLine,
-					Badge:     a.Type.Badge(),
-				}
-				if m.outerSocket != "" {
-					toastCmds = append(toastCmds, m.tmuxDisplayToast(toast))
-				}
-				toastCmds = append(toastCmds, dispatchNotification(Notification{
-					AgentName: a.Name,
-					Badge:     a.Type.Badge(),
-					Event:     NotifyWaiting,
-					Message:   a.LastLine,
-				}, m.outerSocket)...)
+			// No transition from previous confirmed status — clear any pending
+			if a.Status == prev {
+				continue
 			}
-			// Planning transition: agent enters plan mode, will need approval
-			if prev != StatusPlanning && a.Status == StatusPlanning {
-				toastCmds = append(toastCmds, dispatchNotification(Notification{
-					AgentName: a.Name,
-					Badge:     a.Type.Badge(),
-					Event:     NotifyPlanning,
-					Message:   a.LastLine,
-				}, m.outerSocket)...)
-			}
-			// Finished transition: running/planning → idle (desktop notification only)
-			if (prev == StatusRunning || prev == StatusPlanning) && a.Status == StatusIdle {
-				toastCmds = append(toastCmds, dispatchNotification(Notification{
-					AgentName: a.Name,
-					Badge:     a.Type.Badge(),
-					Event:     NotifyFinished,
-					Message:   a.LastLine,
-				}, m.outerSocket)...)
+			// Status differs from previous confirmed status.
+			// Check if this was already pending (seen on last poll too).
+			pending, wasPending := m.pendingTransition[a.Session]
+			if wasPending && pending == a.Status {
+				// Confirmed: same new status for 2 consecutive polls — fire notifications
+				// Waiting transition: tmux toast + desktop notification
+				if prev != StatusWaiting && a.Status == StatusWaiting {
+					toast := Toast{
+						AgentName: a.Name,
+						Message:   a.LastLine,
+						Badge:     a.Type.Badge(),
+					}
+					if m.outerSocket != "" {
+						toastCmds = append(toastCmds, m.tmuxDisplayToast(toast))
+					}
+					toastCmds = append(toastCmds, dispatchNotification(Notification{
+						AgentName: a.Name,
+						Badge:     a.Type.Badge(),
+						Event:     NotifyWaiting,
+						Message:   a.LastLine,
+					}, m.outerSocket)...)
+				}
+				// Planning transition
+				if prev != StatusPlanning && a.Status == StatusPlanning {
+					toastCmds = append(toastCmds, dispatchNotification(Notification{
+						AgentName: a.Name,
+						Badge:     a.Type.Badge(),
+						Event:     NotifyPlanning,
+						Message:   a.LastLine,
+					}, m.outerSocket)...)
+				}
+				// Finished transition: running/planning → idle
+				if (prev == StatusRunning || prev == StatusPlanning) && a.Status == StatusIdle {
+					toastCmds = append(toastCmds, dispatchNotification(Notification{
+						AgentName: a.Name,
+						Badge:     a.Type.Badge(),
+						Event:     NotifyFinished,
+						Message:   a.LastLine,
+					}, m.outerSocket)...)
+				}
+			} else {
+				// First time seeing this transition — record as pending, don't notify yet
+				newPending[a.Session] = a.Status
 			}
 		}
-		// Rebuild previousStatus from current agents (cleans up stale entries)
+		m.pendingTransition = newPending
+		// Rebuild previousStatus: only update to new status once confirmed
+		// (i.e. when the transition was NOT just recorded as pending)
 		newStatus := make(map[string]AgentStatus, len(m.agents))
 		for _, a := range m.agents {
-			newStatus[a.Session] = a.Status
+			if pendingStatus, isPending := newPending[a.Session]; isPending && pendingStatus == a.Status {
+				// Still pending confirmation — keep previous status
+				if prev, ok := m.previousStatus[a.Session]; ok {
+					newStatus[a.Session] = prev
+				} else {
+					newStatus[a.Session] = a.Status
+				}
+			} else {
+				newStatus[a.Session] = a.Status
+			}
 		}
 		m.previousStatus = newStatus
 		// Auto-approve plan mode exits for Claude agents
