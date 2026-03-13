@@ -431,6 +431,10 @@ type Model struct {
 	favorites           map[string]bool        // session name -> is favorite
 	filterFavorites     bool                   // when true, only show favorited agents
 	scrollOffset        int                    // viewport scroll offset for agent list
+	gridMode            bool                   // grid mode active (2x2 pane layout)
+	gridSlot            int                    // active grid slot (0-3)
+	gridPaneIDs         [4]string              // tmux pane IDs (%N) for each grid cell
+	gridAgents          [4]string              // agent target in each slot ("" = empty)
 }
 
 // Messages
@@ -440,6 +444,17 @@ type spinnerTickMsg time.Time
 type attachResultMsg struct {
 	target string
 	err    error
+}
+type gridSetupMsg struct {
+	paneIDs [4]string
+	err     error
+}
+type gridTeardownMsg struct {
+	err error
+}
+type gridAttachResultMsg struct {
+	slot   int
+	target string
 }
 
 // Styles
@@ -1400,6 +1415,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.flatAgents) > 0 && m.cursor < len(m.flatAgents) && !*noAttach {
 				agent := m.flatAgents[m.cursor]
 				if agent.Presence != PresenceNoSession {
+					if m.gridMode {
+						return m, m.gridAttach(m.gridSlot, agent)
+					}
 					return m, m.attachToAgent(agent)
 				}
 			}
@@ -1436,6 +1454,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 			}
 			m.ensureCursorVisible()
+
+		case key.Matches(msg, keys.ToggleGrid):
+			if !*noAttach && m.outerSocket != "" {
+				if m.gridMode {
+					return m, m.exitGridMode()
+				}
+				m.gridMode = true
+				m.gridSlot = 0
+				return m, m.enterGridMode()
+			}
+
+		default:
+			// Grid slot selection: 1-4
+			if m.gridMode {
+				switch msg.String() {
+				case "1":
+					m.gridSlot = 0
+				case "2":
+					m.gridSlot = 1
+				case "3":
+					m.gridSlot = 2
+				case "4":
+					m.gridSlot = 3
+				}
+			}
 		}
 
 	case tea.MouseMsg:
@@ -1475,8 +1518,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var toastCmds []tea.Cmd
 		newPending := make(map[string]AgentStatus)
 		for _, a := range m.agents {
-			// Skip notifications for the currently attached/focused agent
-			if a.Target() == m.attached {
+			// Skip notifications for the currently attached/focused agent(s)
+			if m.gridMode {
+				isGridAgent := false
+				for _, ga := range m.gridAgents {
+					if ga != "" && a.Target() == ga {
+						isGridAgent = true
+						break
+					}
+				}
+				if isGridAgent {
+					continue
+				}
+			} else if a.Target() == m.attached {
 				continue
 			}
 			prev, known := m.previousStatus[a.Session]
@@ -1575,6 +1629,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastActiveAt[a.Session] = time.Now()
 			}
 		}
+		// Grid mode: clean up slots for agents that disappeared
+		if m.gridMode {
+			activeTargets := make(map[string]bool)
+			for _, a := range m.agents {
+				activeTargets[a.Target()] = true
+			}
+			for i, ga := range m.gridAgents {
+				if ga != "" && !activeTargets[ga] {
+					m.gridAgents[i] = ""
+					paneID := m.gridPaneIDs[i]
+					socket := m.outerSocket
+					if paneID != "" {
+						toastCmds = append(toastCmds, func() tea.Msg {
+							exec.Command("tmux", "-L", socket, "respawn-pane", "-k", "-t", paneID, "agent-monitor-placeholder").Run()
+							return nil
+						})
+					}
+				}
+			}
+		}
 		// Inject phantom sessions from groups config
 		if len(m.config.Groups) > 0 {
 			m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
@@ -1604,6 +1678,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.attached = msg.target
 			m.err = nil
 		}
+
+	case gridSetupMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.gridMode = false
+			return m, nil
+		}
+		m.gridPaneIDs = msg.paneIDs
+		// Auto-populate grid with agents
+		selections := m.selectGridAgents()
+		var cmds []tea.Cmd
+		for i, target := range selections {
+			if target != "" {
+				for _, a := range m.flatAgents {
+					if a.Target() == target {
+						cmds = append(cmds, m.gridAttach(i, a))
+						break
+					}
+				}
+			}
+		}
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
+		}
+
+	case gridTeardownMsg:
+		m.attached = m.gridAgents[0]
+		m.gridMode = false
+		m.gridSlot = 0
+		m.gridPaneIDs = [4]string{}
+		m.gridAgents = [4]string{}
+
+	case gridAttachResultMsg:
+		m.gridAgents[msg.slot] = msg.target
 	}
 
 	return m, nil
@@ -1815,13 +1923,150 @@ func sendPlanApproval(agent Agent, outerSocket string) tea.Cmd {
 	}
 }
 
-// focusRightPane switches focus to the right pane
+// focusRightPane switches focus to the right pane (or active grid slot)
 func (m Model) focusRightPane() tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command("tmux", "-L", m.outerSocket, "select-pane", "-t", "0.1")
-		cmd.Run()
+		if m.gridMode && m.gridPaneIDs[m.gridSlot] != "" {
+			exec.Command("tmux", "-L", m.outerSocket, "select-pane", "-t", m.gridPaneIDs[m.gridSlot]).Run()
+		} else {
+			exec.Command("tmux", "-L", m.outerSocket, "select-pane", "-t", "0.1").Run()
+		}
 		return nil
 	}
+}
+
+// enterGridMode splits the right pane into a 2x2 grid.
+func (m Model) enterGridMode() tea.Cmd {
+	return func() tea.Msg {
+		socket := m.outerSocket
+		if socket == "" {
+			return gridSetupMsg{err: fmt.Errorf("no outer socket")}
+		}
+
+		// Get TUI pane ID (index 0)
+		tuiOut, err := exec.Command("tmux", "-L", socket, "display-message", "-t", "0.0", "-p", "#{pane_id}").Output()
+		if err != nil {
+			return gridSetupMsg{err: err}
+		}
+		tuiPaneID := strings.TrimSpace(string(tuiOut))
+
+		// Get right pane ID (index 1)
+		rightOut, err := exec.Command("tmux", "-L", socket, "display-message", "-t", "0.1", "-p", "#{pane_id}").Output()
+		if err != nil {
+			return gridSetupMsg{err: err}
+		}
+		rightPaneID := strings.TrimSpace(string(rightOut))
+
+		// Respawn right pane as placeholder (clear any attached session)
+		exec.Command("tmux", "-L", socket, "respawn-pane", "-k", "-t", rightPaneID, "agent-monitor-placeholder").Run()
+
+		// Split right pane vertically → top + bottom
+		exec.Command("tmux", "-L", socket, "split-window", "-v", "-t", rightPaneID, "agent-monitor-placeholder").Run()
+
+		// Find bottom pane ID (the new pane)
+		out, _ := exec.Command("tmux", "-L", socket, "list-panes", "-t", "0", "-F", "#{pane_id}").Output()
+		var bottomPaneID string
+		for _, id := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if id != tuiPaneID && id != rightPaneID {
+				bottomPaneID = id
+				break
+			}
+		}
+
+		// Split top pane horizontally → top-left + top-right
+		exec.Command("tmux", "-L", socket, "split-window", "-h", "-t", rightPaneID, "agent-monitor-placeholder").Run()
+
+		// Split bottom pane horizontally → bottom-left + bottom-right
+		if bottomPaneID != "" {
+			exec.Command("tmux", "-L", socket, "split-window", "-h", "-t", bottomPaneID, "agent-monitor-placeholder").Run()
+		}
+
+		// Collect grid pane IDs (all panes except TUI, in display order)
+		out, _ = exec.Command("tmux", "-L", socket, "list-panes", "-t", "0", "-F", "#{pane_id}").Output()
+		var paneIDs [4]string
+		idx := 0
+		for _, id := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if id != tuiPaneID && idx < 4 {
+				paneIDs[idx] = id
+				idx++
+			}
+		}
+
+		// Refocus TUI pane
+		exec.Command("tmux", "-L", socket, "select-pane", "-t", tuiPaneID).Run()
+
+		return gridSetupMsg{paneIDs: paneIDs}
+	}
+}
+
+// exitGridMode collapses the grid back to a single right pane, keeping slot 0.
+func (m Model) exitGridMode() tea.Cmd {
+	return func() tea.Msg {
+		socket := m.outerSocket
+		// Kill grid panes 1-3 (in reverse order to avoid index shifting)
+		for i := 3; i >= 1; i-- {
+			if m.gridPaneIDs[i] != "" {
+				exec.Command("tmux", "-L", socket, "kill-pane", "-t", m.gridPaneIDs[i]).Run()
+			}
+		}
+		// If slot 0 has no agent, respawn as placeholder
+		if m.gridAgents[0] == "" && m.gridPaneIDs[0] != "" {
+			exec.Command("tmux", "-L", socket, "respawn-pane", "-k", "-t", m.gridPaneIDs[0], "agent-monitor-placeholder").Run()
+		}
+		return gridTeardownMsg{}
+	}
+}
+
+// gridAttach attaches an agent to a specific grid slot's pane.
+func (m Model) gridAttach(slot int, agent Agent) tea.Cmd {
+	return func() tea.Msg {
+		paneID := m.gridPaneIDs[slot]
+		if paneID == "" {
+			return nil
+		}
+		target := agent.Target()
+		attachTarget := target
+		if agent.Presence == PresenceNoAgent {
+			attachTarget = agent.Session
+		}
+		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", attachTarget)
+		exec.Command("tmux", "-L", m.outerSocket, "respawn-pane", "-k", "-t", paneID, attachCmd).Run()
+		return gridAttachResultMsg{slot: slot, target: target}
+	}
+}
+
+// selectGridAgents picks up to 4 agents for grid auto-population.
+// Favorites first, then active agents.
+func (m Model) selectGridAgents() [4]string {
+	var targets [4]string
+	slot := 0
+	assigned := make(map[string]bool)
+
+	// Favorites first
+	for _, a := range m.flatAgents {
+		if slot >= 4 {
+			break
+		}
+		if m.favorites[a.Session] && a.Presence == PresenceActive {
+			targets[slot] = a.Target()
+			assigned[a.Target()] = true
+			slot++
+		}
+	}
+
+	// Then remaining active agents
+	for _, a := range m.flatAgents {
+		if slot >= 4 {
+			break
+		}
+		if a.Presence == PresenceActive && !assigned[a.Target()] {
+			targets[slot] = a.Target()
+			assigned[a.Target()] = true
+			slot++
+		}
+	}
+
+	return targets
 }
 
 // renderStatusSymbol returns the colored status symbol for an agent,
@@ -1886,7 +2131,21 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	if displayName != "" {
 		name = displayName
 	}
-	if agent.Target() == m.attached {
+	// Attached / grid slot indicator
+	indicator := ""
+	if m.gridMode {
+		slotChars := []string{"①", "②", "③", "④"}
+		for i, ga := range m.gridAgents {
+			if ga != "" && ga == agent.Target() {
+				if i == m.gridSlot {
+					indicator = " " + attachedStyle.Render(slotChars[i])
+				} else {
+					indicator = " " + dimStyle.Render(slotChars[i])
+				}
+				break
+			}
+		}
+	} else if agent.Target() == m.attached {
 		name = attachedStyle.Render(name + " ◀")
 	}
 
@@ -1898,7 +2157,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	}
 
 	badge := agent.Type.BadgeStyle().Render(agent.Type.Badge())
-	line := fmt.Sprintf("%s %s %s%s%s", symbol, badge, name, suffix, favSuffix)
+	line := fmt.Sprintf("%s %s %s%s%s%s", symbol, badge, name, indicator, suffix, favSuffix)
 
 	if idx == m.cursor {
 		line = selectedStyle.Render(indent + "> " + line)
@@ -2121,7 +2380,12 @@ func (m Model) View() string {
 	agentPanel := panelStyle.Width(panelWidth).Render(content.String())
 
 	// Help bar with its own border
-	helpKeys := "j/k:nav  ⏎:attach  l:focus  ␣:fav  f:filter  a:activity  q:quit"
+	var helpKeys string
+	if m.gridMode {
+		helpKeys = fmt.Sprintf("j/k:nav  ⏎:assign[%d]  1-4:slot  l:focus  g:single  q:quit", m.gridSlot+1)
+	} else {
+		helpKeys = "j/k:nav  ⏎:attach  l:focus  ␣:fav  f:filter  g:grid  a:activity  q:quit"
+	}
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
@@ -2138,6 +2402,7 @@ type keyMap struct {
 	ToggleActivity  key.Binding
 	ToggleFavorite  key.Binding
 	FilterFavorites key.Binding
+	ToggleGrid      key.Binding
 	Quit            key.Binding
 }
 
@@ -2165,6 +2430,9 @@ var keys = keyMap{
 	),
 	FilterFavorites: key.NewBinding(
 		key.WithKeys("f"),
+	),
+	ToggleGrid: key.NewBinding(
+		key.WithKeys("g"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
