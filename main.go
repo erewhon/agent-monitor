@@ -2035,14 +2035,53 @@ func (m Model) gridAttach(slot int, agent Agent) tea.Cmd {
 	}
 }
 
+// cursorGroupAgents returns the active agents in the same group as the cursor agent.
+func (m Model) cursorGroupAgents() []Agent {
+	if len(m.flatAgents) == 0 || m.cursor >= len(m.flatAgents) {
+		return nil
+	}
+	cursorSession := m.flatAgents[m.cursor].Session
+	for _, g := range m.groups {
+		allAgents := flattenItems(g.Items)
+		found := false
+		for _, a := range allAgents {
+			if a.Session == cursorSession {
+				found = true
+				break
+			}
+		}
+		if found {
+			var active []Agent
+			for _, a := range allAgents {
+				if a.Presence == PresenceActive {
+					active = append(active, a)
+				}
+			}
+			return active
+		}
+	}
+	return nil
+}
+
 // selectGridAgents picks up to 4 agents for grid auto-population.
-// Favorites first, then active agents.
+// If the cursor's group has ≤4 active agents, uses that group.
+// Otherwise: favorites first, then active agents.
 func (m Model) selectGridAgents() [4]string {
 	var targets [4]string
 	slot := 0
-	assigned := make(map[string]bool)
 
-	// Favorites first
+	// Try cursor's group first
+	groupAgents := m.cursorGroupAgents()
+	if len(groupAgents) > 0 && len(groupAgents) <= 4 {
+		for _, a := range groupAgents {
+			targets[slot] = a.Target()
+			slot++
+		}
+		return targets
+	}
+
+	// Fall back to favorites then active agents
+	assigned := make(map[string]bool)
 	for _, a := range m.flatAgents {
 		if slot >= 4 {
 			break
@@ -2053,8 +2092,6 @@ func (m Model) selectGridAgents() [4]string {
 			slot++
 		}
 	}
-
-	// Then remaining active agents
 	for _, a := range m.flatAgents {
 		if slot >= 4 {
 			break
@@ -2382,9 +2419,9 @@ func (m Model) View() string {
 	// Help bar with its own border
 	var helpKeys string
 	if m.gridMode {
-		helpKeys = fmt.Sprintf("j/k:nav  ⏎:assign[%d]  1-4:slot  l:focus  g:single  q:quit", m.gridSlot+1)
+		helpKeys = fmt.Sprintf("j/k:nav  ⏎:assign[%d]  1-4:slot  l:focus  g:single  C-\\h:back  q:quit", m.gridSlot+1)
 	} else {
-		helpKeys = "j/k:nav  ⏎:attach  l:focus  ␣:fav  f:filter  g:grid  a:activity  q:quit"
+		helpKeys = "j/k:nav  ⏎:attach  l:focus  C-\\h:back  ␣:fav  f:filter  g:grid  a:activity  q:quit"
 	}
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
