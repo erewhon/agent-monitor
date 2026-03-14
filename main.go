@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -34,6 +35,9 @@ var (
 	ntfyTopic         = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
 	ntfyServer        = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
 	notifyCmd         = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
+	webPort           = flag.Int("web-port", 8070, "HTTP API port")
+	noWeb             = flag.Bool("no-web", false, "Disable embedded HTTP server")
+	webOnly           = flag.Bool("web-only", false, "Run HTTP server only, no TUI")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -407,6 +411,158 @@ func dispatchNotification(n Notification, outerSocket string) []tea.Cmd {
 	return cmds
 }
 
+// SharedState provides thread-safe read access to agent state for the HTTP server.
+type SharedState struct {
+	mu        sync.RWMutex
+	agents    []Agent
+	groups    []Group
+	startTime time.Time
+}
+
+func (s *SharedState) Update(agents []Agent, groups []Group) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Store copies so the TUI can freely replace its own slices
+	s.agents = make([]Agent, len(agents))
+	copy(s.agents, agents)
+	s.groups = make([]Group, len(groups))
+	copy(s.groups, groups)
+}
+
+func (s *SharedState) GetAgents() []Agent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Agent, len(s.agents))
+	copy(out, s.agents)
+	return out
+}
+
+func (s *SharedState) GetGroups() []Group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Group, len(s.groups))
+	copy(out, s.groups)
+	return out
+}
+
+// API response types — JSON-friendly representations of internal state
+type apiAgent struct {
+	Name      string    `json:"name"`
+	Session   string    `json:"session"`
+	Target    string    `json:"target"`
+	Type      string    `json:"type"`
+	Badge     string    `json:"badge"`
+	Status    string    `json:"status"`
+	Presence  string    `json:"presence"`
+	LastLine  string    `json:"last_line,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type apiGroup struct {
+	Name   string     `json:"name"`
+	Agents []apiAgent `json:"agents"`
+}
+
+type apiStatus struct {
+	Version    string    `json:"version"`
+	Uptime     string    `json:"uptime"`
+	UptimeSecs float64   `json:"uptime_secs"`
+	AgentCount int       `json:"agent_count"`
+	StartTime  time.Time `json:"start_time"`
+}
+
+func toAPIAgent(a Agent) apiAgent {
+	presence := "unknown"
+	switch a.Presence {
+	case PresenceActive:
+		presence = "active"
+	case PresenceNoAgent:
+		presence = "no_agent"
+	case PresenceNoSession:
+		presence = "no_session"
+	}
+	return apiAgent{
+		Name:      a.Name,
+		Session:   a.Session,
+		Target:    a.Target(),
+		Type:      string(a.Type),
+		Badge:     a.Type.Badge(),
+		Status:    a.Status.String(),
+		Presence:  presence,
+		LastLine:  a.LastLine,
+		UpdatedAt: a.UpdatedAt,
+	}
+}
+
+func toAPIGroup(g Group) apiGroup {
+	agents := flattenItems(g.Items)
+	apiAgents := make([]apiAgent, len(agents))
+	for i, a := range agents {
+		apiAgents[i] = toAPIAgent(a)
+	}
+	return apiGroup{
+		Name:   g.Name,
+		Agents: apiAgents,
+	}
+}
+
+// startWebServer launches the HTTP API server on a separate goroutine.
+func startWebServer(port int, state *SharedState) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
+		agents := state.GetAgents()
+		result := make([]apiAgent, len(agents))
+		for i, a := range agents {
+			result[i] = toAPIAgent(a)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	mux.HandleFunc("GET /api/groups", func(w http.ResponseWriter, r *http.Request) {
+		groups := state.GetGroups()
+		result := make([]apiGroup, len(groups))
+		for i, g := range groups {
+			result[i] = toAPIGroup(g)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
+		agents := state.GetAgents()
+		uptime := time.Since(state.startTime)
+		result := apiStatus{
+			Version:    version,
+			Uptime:     uptime.Round(time.Second).String(),
+			UptimeSecs: uptime.Seconds(),
+			AgentCount: len(agents),
+			StartTime:  state.startTime,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	// CORS middleware
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: handler,
+	}
+	server.ListenAndServe()
+}
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents       []Agent
@@ -435,6 +591,7 @@ type Model struct {
 	gridSlot            int                    // active grid slot (0-3)
 	gridPaneIDs         [4]string              // tmux pane IDs (%N) for each grid cell
 	gridAgents          [4]string              // agent target in each slot ("" = empty)
+	sharedState         *SharedState           // shared state for HTTP API (nil if --no-web)
 }
 
 // Messages
@@ -528,7 +685,7 @@ var (
 			Foreground(lipgloss.Color("220")) // yellow star
 )
 
-func initialModel() Model {
+func initialModel(sharedState *SharedState) Model {
 	m := Model{
 		agents:              []Agent{},
 		cursor:              0,
@@ -539,6 +696,7 @@ func initialModel() Model {
 		pendingTransition:   make(map[string]AgentStatus),
 		planPendingApproval: make(map[string]bool),
 		favorites:           loadFavorites(),
+		sharedState:         sharedState,
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -1654,6 +1812,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 		}
 		m.buildGroups()
+		if m.sharedState != nil {
+			m.sharedState.Update(m.flatAgents, m.groups)
+		}
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
 		}
@@ -2481,7 +2642,7 @@ func main() {
 
 	// List mode: just print agents and exit
 	if *listOnly {
-		m := initialModel()
+		m := initialModel(nil)
 		m.agents = detectAgentsSync()
 		m.buildGroups()
 		agents := m.flatAgents
@@ -2496,7 +2657,31 @@ func main() {
 		return
 	}
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Start embedded HTTP server
+	var sharedState *SharedState
+	if !*noWeb || *webOnly {
+		sharedState = &SharedState{startTime: time.Now()}
+		go startWebServer(*webPort, sharedState)
+	}
+
+	// Web-only mode: run HTTP server with a polling loop, no TUI
+	if *webOnly {
+		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
+		m := initialModel(sharedState)
+		for {
+			m.agents = detectAgentsSync()
+			if len(m.config.Groups) > 0 {
+				m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
+			}
+			m.buildGroups()
+			if sharedState != nil {
+				sharedState.Update(m.flatAgents, m.groups)
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	p := tea.NewProgram(initialModel(sharedState), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
