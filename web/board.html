@@ -481,6 +481,9 @@
           html += '<button onclick="moveTask(' + task.id + ',\'' + col + '\')">' + label + '</button>';
         }
       });
+      if (task.column === 'backlog') {
+        html += '<button onclick="launchTask(' + task.id + ',\'' + escapeHtml(task.title) + '\')" style="color:var(--status-running)">▶ Launch</button>';
+      }
       html += '<button onclick="deleteTask(' + task.id + ')" style="color:var(--status-error)">✕</button>';
       html += '</div>';
 
@@ -619,6 +622,31 @@
       await fetch('/api/tasks/' + id, { method: 'DELETE' });
     }
 
+    let availableProjects = [];
+    async function loadProjects() {
+      const resp = await fetch('/api/projects');
+      availableProjects = await resp.json();
+    }
+
+    async function launchTask(taskId, taskTitle) {
+      if (availableProjects.length === 0) {
+        alert('No projects configured in projects.yaml');
+        return;
+      }
+      const names = availableProjects.map(p => p.name);
+      const choice = prompt('Launch project:\\n' + names.join(', ') + '\\n\\nEnter project name:');
+      if (!choice || !names.includes(choice)) return;
+
+      const resp = await fetch('/api/launch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: choice, task_id: taskId, task: taskTitle }),
+      });
+      if (!resp.ok) {
+        alert('Launch failed: ' + await resp.text());
+      }
+    }
+
     // UI helpers
     function openCreateModal() {
       document.getElementById('new-title').value = '';
@@ -655,6 +683,7 @@
 
     // Init
     loadTasks();
+    loadProjects();
     connectSSE();
   </script>
 </body>

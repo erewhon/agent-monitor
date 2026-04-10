@@ -1141,6 +1141,93 @@ func hasTag(page nousPage, tag string) bool {
 	return false
 }
 
+// ProjectConfig defines a launchable project.
+type ProjectConfig struct {
+	Name  string `yaml:"name"`
+	Path  string `yaml:"path"`
+	Agent string `yaml:"agent"` // "claude", "opencode", "codex"
+}
+
+type ProjectsConfig struct {
+	Projects []ProjectConfig `yaml:"projects"`
+}
+
+func loadProjectsConfig() *ProjectsConfig {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(home, ".config", "agent-monitor", "projects.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cfg ProjectsConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	// Expand ~ in paths
+	for i := range cfg.Projects {
+		if strings.HasPrefix(cfg.Projects[i].Path, "~/") {
+			cfg.Projects[i].Path = filepath.Join(home, cfg.Projects[i].Path[2:])
+		}
+	}
+	return &cfg
+}
+
+func (cfg *ProjectsConfig) Find(name string) *ProjectConfig {
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == name {
+			return &cfg.Projects[i]
+		}
+	}
+	return nil
+}
+
+// launchSession creates a tmux session for a project and optionally primes Claude with a task.
+func launchSession(project ProjectConfig, taskPrompt string) error {
+	// Check if session already exists
+	check := exec.Command("tmux", "has-session", "-t", project.Name)
+	if check.Run() == nil {
+		return fmt.Errorf("session %q already exists", project.Name)
+	}
+
+	// Determine agent command
+	agentCmd := "claude"
+	switch project.Agent {
+	case "opencode":
+		agentCmd = "opencode"
+	case "codex":
+		agentCmd = "codex"
+	case "claude", "":
+		agentCmd = "claude"
+	}
+
+	// Create tmux session in project directory
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", project.Name, "-c", project.Path)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create session: %w", err)
+	}
+
+	// Launch the agent
+	if taskPrompt != "" {
+		// Start agent with initial prompt
+		exec.Command("tmux", "send-keys", "-t", project.Name, agentCmd+" "+shellQuote(taskPrompt), "Enter").Run()
+	} else {
+		exec.Command("tmux", "send-keys", "-t", project.Name, agentCmd, "Enter").Run()
+	}
+
+	return nil
+}
+
+// shellQuote wraps a string in single quotes, escaping existing single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 // startNousSyncLoop runs bidirectional sync between the Kanban board and Nous notebooks.
 func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
 	nous := newNousClient(cfg)
@@ -1427,6 +1514,69 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 			hub.Broadcast(SSEEvent{Type: "task:deleted", Data: data})
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Launch endpoint
+	projects := loadProjectsConfig()
+	mux.HandleFunc("POST /api/launch", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Project string `json:"project"`
+			TaskID  int    `json:"task_id,omitempty"`
+			Task    string `json:"task,omitempty"`
+			Feature string `json:"feature,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		project := projects.Find(req.Project)
+		if project == nil {
+			http.Error(w, "unknown project", http.StatusBadRequest)
+			return
+		}
+
+		var prompt string
+		if req.Task != "" {
+			prompt = fmt.Sprintf("Read task spec '%s' from Forge and execute it", req.Task)
+		} else if req.Feature != "" {
+			prompt = fmt.Sprintf("/do-feature %s %s", req.Project, req.Feature)
+		}
+
+		if err := launchSession(*project, prompt); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+
+		// Link task to session if task_id provided
+		if req.TaskID > 0 {
+			sessionName := project.Name
+			tasks.Update(req.TaskID, taskPatchRequest{SessionName: &sessionName})
+			if hub != nil {
+				if t, ok := tasks.Get(req.TaskID); ok {
+					data, _ := json.Marshal(t)
+					hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "launched",
+			"session": project.Name,
+		})
+	})
+
+	// List available projects
+	mux.HandleFunc("GET /api/projects", func(w http.ResponseWriter, r *http.Request) {
+		var result []ProjectConfig
+		if projects != nil {
+			result = projects.Projects
+		}
+		if result == nil {
+			result = []ProjectConfig{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 	})
 
 	// Webhook endpoint for push-based agent state
@@ -3622,6 +3772,51 @@ var keys = keyMap{
 
 func main() {
 	flag.Parse()
+
+	// Subcommand: launch <project> [--task <task>] [--feature <feature>]
+	if len(flag.Args()) >= 2 && flag.Args()[0] == "launch" {
+		projectName := flag.Args()[1]
+		projects := loadProjectsConfig()
+		project := projects.Find(projectName)
+		if project == nil {
+			fmt.Fprintf(os.Stderr, "Unknown project %q. Check ~/.config/agent-monitor/projects.yaml\n", projectName)
+			os.Exit(1)
+		}
+
+		// Parse launch-specific flags
+		var taskName, featureName string
+		for i := 2; i < len(flag.Args()); i++ {
+			switch flag.Args()[i] {
+			case "--task":
+				if i+1 < len(flag.Args()) {
+					taskName = flag.Args()[i+1]
+					i++
+				}
+			case "--feature":
+				if i+1 < len(flag.Args()) {
+					featureName = flag.Args()[i+1]
+					i++
+				}
+			}
+		}
+
+		var prompt string
+		if taskName != "" {
+			prompt = fmt.Sprintf("Read task spec '%s' from Forge and execute it", taskName)
+		} else if featureName != "" {
+			prompt = fmt.Sprintf("/do-feature %s %s", projectName, featureName)
+		}
+
+		if err := launchSession(*project, prompt); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Launched %s in session %q\n", project.Agent, project.Name)
+		if prompt != "" {
+			fmt.Printf("Prompt: %s\n", prompt)
+		}
+		return
+	}
 
 	// Subcommand: webhook-key generate
 	if len(flag.Args()) >= 2 && flag.Args()[0] == "webhook-key" && flag.Args()[1] == "generate" {
