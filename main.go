@@ -851,6 +851,101 @@ func (ts *TaskStore) AutoLink(agents []Agent, hub *SSEHub) {
 	}
 }
 
+// WebhookState holds the last push-based state for an agent session.
+type WebhookState struct {
+	Session   string      `json:"session"`
+	AgentType string      `json:"agent_type"`
+	Status    string      `json:"status"`
+	Detail    string      `json:"detail,omitempty"`
+	Timestamp time.Time   `json:"timestamp"`
+}
+
+// WebhookStore tracks push-based agent state from hooks.
+type WebhookStore struct {
+	mu     sync.RWMutex
+	states map[string]WebhookState
+}
+
+func newWebhookStore() *WebhookStore {
+	return &WebhookStore{states: make(map[string]WebhookState)}
+}
+
+const webhookTTL = 30 * time.Second
+
+func (ws *WebhookStore) Set(state WebhookState) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if state.Timestamp.IsZero() {
+		state.Timestamp = time.Now()
+	}
+	ws.states[state.Session] = state
+}
+
+// Get returns the webhook state for a session if it's fresh (within TTL).
+func (ws *WebhookStore) Get(session string) (WebhookState, bool) {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	state, ok := ws.states[session]
+	if !ok || time.Since(state.Timestamp) > webhookTTL {
+		return WebhookState{}, false
+	}
+	return state, true
+}
+
+// parseWebhookStatus converts a webhook status string to AgentStatus.
+func parseWebhookStatus(s string) AgentStatus {
+	switch s {
+	case "running":
+		return StatusRunning
+	case "waiting":
+		return StatusWaiting
+	case "idle":
+		return StatusIdle
+	case "planning":
+		return StatusPlanning
+	case "error":
+		return StatusError
+	default:
+		return StatusUnknown
+	}
+}
+
+// parseWebhookAgentType converts a webhook agent_type string to AgentType.
+func parseWebhookAgentType(s string) AgentType {
+	switch s {
+	case "claude":
+		return AgentClaude
+	case "opencode":
+		return AgentOpenCode
+	case "crush":
+		return AgentCrush
+	case "codex":
+		return AgentCodex
+	default:
+		return AgentUnknown
+	}
+}
+
+// mergeWebhookState overrides scraped agent status with fresh webhook state.
+func mergeWebhookState(agents []Agent, ws *WebhookStore) {
+	if ws == nil {
+		return
+	}
+	for i := range agents {
+		state, ok := ws.Get(agents[i].Session)
+		if !ok {
+			continue
+		}
+		newStatus := parseWebhookStatus(state.Status)
+		if newStatus != StatusUnknown {
+			agents[i].Status = newStatus
+		}
+		if state.Detail != "" {
+			agents[i].LastLine = state.Detail
+		}
+	}
+}
+
 //go:embed web/board.html
 var boardHTML string
 
@@ -861,7 +956,7 @@ type boardData struct {
 }
 
 // startWebServer launches the HTTP API server on a separate goroutine.
-func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore) {
+func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore, webhooks *WebhookStore) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
@@ -963,6 +1058,31 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore)
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	// Webhook endpoint for push-based agent state
+	mux.HandleFunc("POST /api/webhook", func(w http.ResponseWriter, r *http.Request) {
+		var state WebhookState
+		if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if state.Session == "" {
+			http.Error(w, "session required", http.StatusBadRequest)
+			return
+		}
+		if state.Status == "" {
+			http.Error(w, "status required", http.StatusBadRequest)
+			return
+		}
+		webhooks.Set(state)
+		// Broadcast as SSE event
+		if hub != nil {
+			data, _ := json.Marshal(state)
+			hub.Broadcast(SSEEvent{Type: "webhook:state", Data: data})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
+	})
+
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		agents := state.GetAgents()
 		uptime := time.Since(state.startTime)
@@ -1054,6 +1174,7 @@ type Model struct {
 	sharedState         *SharedState           // shared state for HTTP API (nil if --no-web)
 	sseHub              *SSEHub                // SSE event hub (nil if --no-web)
 	taskStore           *TaskStore             // persistent task storage (nil if --no-web)
+	webhookStore        *WebhookStore          // push-based agent state (nil if --no-web)
 }
 
 // Messages
@@ -1147,7 +1268,7 @@ var (
 			Foreground(lipgloss.Color("220")) // yellow star
 )
 
-func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore) Model {
+func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore, webhookStore *WebhookStore) Model {
 	m := Model{
 		agents:              []Agent{},
 		cursor:              0,
@@ -1161,6 +1282,7 @@ func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore
 		sharedState:         sharedState,
 		sseHub:              sseHub,
 		taskStore:           taskStore,
+		webhookStore:        webhookStore,
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -2133,6 +2255,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentUpdateMsg:
 		m.agents = []Agent(msg)
+		// Merge push-based webhook state (overrides scraping when fresh)
+		mergeWebhookState(m.agents, m.webhookStore)
 		// Detect transitions with debouncing: a status change must persist
 		// for 2 consecutive polls before triggering notifications. This
 		// prevents spurious alerts when detection briefly flickers (e.g.
@@ -3112,9 +3236,57 @@ var keys = keyMap{
 func main() {
 	flag.Parse()
 
+	// Subcommand: hooks install
+	if len(flag.Args()) >= 2 && flag.Args()[0] == "hooks" && flag.Args()[1] == "install" {
+		port := *webPort
+		hookScript := fmt.Sprintf(`#!/bin/bash
+# agent-monitor hook — posts state changes to the webhook endpoint
+# Usage: agent-monitor-hook <status> [detail]
+# Install: agent-monitor hooks install
+SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+[ -z "$SESSION" ] && exit 0
+STATUS="${1:-running}"
+DETAIL="${2:-}"
+curl -sX POST http://localhost:%d/api/webhook \
+  -H 'Content-Type: application/json' \
+  -d "{\"session\":\"$SESSION\",\"agent_type\":\"claude\",\"status\":\"$STATUS\",\"detail\":\"$DETAIL\"}" &>/dev/null &`, port)
+
+		hookConfig := fmt.Sprintf(`Add to ~/.claude/settings.json under "hooks":
+
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"running\\\",\\\"detail\\\":\\\"$CLAUDE_TOOL\\\"}\" &>/dev/null &"
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\"}\" &>/dev/null &"
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"idle\\\"}\" &>/dev/null &"
+      }
+    ]
+  }
+}`, port, port, port)
+
+		fmt.Println("=== Hook Script ===")
+		fmt.Println(hookScript)
+		fmt.Println()
+		fmt.Println("=== Claude Code Settings ===")
+		fmt.Println(hookConfig)
+		return
+	}
+
 	// List mode: just print agents and exit
 	if *listOnly {
-		m := initialModel(nil, nil, nil)
+		m := initialModel(nil, nil, nil, nil)
 		m.agents = detectAgentsSync()
 		m.buildGroups()
 		agents := m.flatAgents
@@ -3133,19 +3305,22 @@ func main() {
 	var sharedState *SharedState
 	var sseHub *SSEHub
 	var taskStore *TaskStore
+	var webhookStore *WebhookStore
 	if !*noWeb || *webOnly {
 		sharedState = &SharedState{startTime: time.Now()}
 		sseHub = newSSEHub(sharedState)
 		taskStore = newTaskStore()
-		go startWebServer(*webPort, sharedState, sseHub, taskStore)
+		webhookStore = newWebhookStore()
+		go startWebServer(*webPort, sharedState, sseHub, taskStore, webhookStore)
 	}
 
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
-		m := initialModel(sharedState, sseHub, taskStore)
+		m := initialModel(sharedState, sseHub, taskStore, webhookStore)
 		for {
 			m.agents = detectAgentsSync()
+			mergeWebhookState(m.agents, webhookStore)
 			if len(m.config.Groups) > 0 {
 				m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 			}
@@ -3165,7 +3340,7 @@ func main() {
 		}
 	}
 
-	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
