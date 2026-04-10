@@ -984,6 +984,266 @@ func mergeWebhookState(agents []Agent, ws *WebhookStore) {
 	}
 }
 
+// NousConfig holds Nous notebook sync settings from ~/.config/agent-monitor/nous.yaml.
+type NousConfig struct {
+	URL          string `yaml:"url"`
+	Notebook     string `yaml:"notebook"`
+	Tag          string `yaml:"tag"`
+	PollInterval int    `yaml:"poll_interval"`
+}
+
+func loadNousConfig() *NousConfig {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(home, ".config", "agent-monitor", "nous.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cfg NousConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	if cfg.URL == "" {
+		cfg.URL = "http://localhost:7667"
+	}
+	if cfg.Tag == "" {
+		cfg.Tag = "agent-monitor"
+	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 30
+	}
+	return &cfg
+}
+
+// NousClient wraps the Nous HTTP API.
+type NousClient struct {
+	baseURL    string
+	notebookID string
+	notebook   string
+	tag        string
+	client     *http.Client
+}
+
+type nousEnvelope struct {
+	Data  json.RawMessage `json:"data"`
+	Error string          `json:"error"`
+}
+
+type nousNotebook struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type nousPage struct {
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Tags      []string `json:"tags"`
+	UpdatedAt string   `json:"updatedAt"`
+}
+
+func newNousClient(cfg *NousConfig) *NousClient {
+	return &NousClient{
+		baseURL:  cfg.URL,
+		notebook: cfg.Notebook,
+		tag:      cfg.Tag,
+		client:   &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func (c *NousClient) resolveNotebookID() error {
+	if c.notebookID != "" {
+		return nil
+	}
+	resp, err := c.client.Get(c.baseURL + "/api/notebooks")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var env nousEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return err
+	}
+	var notebooks []nousNotebook
+	json.Unmarshal(env.Data, &notebooks)
+	for _, nb := range notebooks {
+		if nb.Name == c.notebook {
+			c.notebookID = nb.ID
+			return nil
+		}
+	}
+	return fmt.Errorf("notebook %q not found", c.notebook)
+}
+
+func (c *NousClient) listPages() ([]nousPage, error) {
+	if err := c.resolveNotebookID(); err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/pages")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var env nousEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, err
+	}
+	var pages []nousPage
+	json.Unmarshal(env.Data, &pages)
+	return pages, nil
+}
+
+func (c *NousClient) updateTags(pageID string, tags []string) error {
+	if err := c.resolveNotebookID(); err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string][]string{"tags": tags})
+	req, _ := http.NewRequest("PUT",
+		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/tags",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return nil
+}
+
+func (c *NousClient) appendToPage(pageID, content string) error {
+	if err := c.resolveNotebookID(); err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string]string{"content": content})
+	req, _ := http.NewRequest("POST",
+		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/append",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return nil
+}
+
+// hasTag checks if a page has a specific tag.
+func hasTag(page nousPage, tag string) bool {
+	for _, t := range page.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// startNousSyncLoop runs bidirectional sync between the Kanban board and Nous notebooks.
+func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
+	nous := newNousClient(cfg)
+	interval := time.Duration(cfg.PollInterval) * time.Second
+
+	// Build initial state
+	knownPages := make(map[string]bool)
+	for _, t := range tasks.List(true) {
+		if t.NousPageID != "" {
+			knownPages[t.NousPageID] = true
+		}
+	}
+	prevColumns := make(map[int]TaskColumn)
+	for _, t := range tasks.List(false) {
+		prevColumns[t.ID] = t.Column
+	}
+
+	for {
+		// --- Nous → Board ---
+		pages, err := nous.listPages()
+		if err == nil {
+			for _, page := range pages {
+				if !hasTag(page, cfg.Tag) {
+					continue
+				}
+				if knownPages[page.ID] {
+					for _, t := range tasks.List(false) {
+						if t.NousPageID == page.ID && t.Title != page.Title {
+							title := page.Title
+							tasks.Update(t.ID, taskPatchRequest{Title: &title})
+							if hub != nil {
+								updated, _ := tasks.Get(t.ID)
+								data, _ := json.Marshal(updated)
+								hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
+							}
+						}
+					}
+					continue
+				}
+				task := tasks.Create(page.Title, "", "", "")
+				nousID := page.ID
+				tasks.Update(task.ID, taskPatchRequest{NousPageID: &nousID})
+				knownPages[page.ID] = true
+				if hub != nil {
+					updated, _ := tasks.Get(task.ID)
+					data, _ := json.Marshal(updated)
+					hub.Broadcast(SSEEvent{Type: "task:created", Data: data})
+				}
+			}
+
+			// --- Board → Nous ---
+			currentTasks := tasks.List(false)
+			for _, t := range currentTasks {
+				if t.NousPageID == "" {
+					continue
+				}
+				prev, known := prevColumns[t.ID]
+				if !known {
+					prevColumns[t.ID] = t.Column
+					continue
+				}
+				if t.Column == prev {
+					continue
+				}
+				prevColumns[t.ID] = t.Column
+
+				var page *nousPage
+				for _, p := range pages {
+					if p.ID == t.NousPageID {
+						page = &p
+						break
+					}
+				}
+				if page == nil {
+					continue
+				}
+
+				newTags := make([]string, 0, len(page.Tags)+2)
+				for _, tag := range page.Tags {
+					if tag != "active" && tag != "done" && tag != "needs-input" {
+						newTags = append(newTags, tag)
+					}
+				}
+				switch t.Column {
+				case ColumnActive:
+					newTags = append(newTags, "active")
+				case ColumnNeedsInput:
+					newTags = append(newTags, "needs-input")
+				case ColumnDone:
+					newTags = append(newTags, "done")
+				}
+				nous.updateTags(t.NousPageID, newTags)
+
+				logEntry := fmt.Sprintf("\n---\n*%s — moved to %s*\n",
+					time.Now().Format("2006-01-02 15:04"), t.Column)
+				nous.appendToPage(t.NousPageID, logEntry)
+			}
+		}
+
+		time.Sleep(interval)
+	}
+}
+
 // startForwarder periodically sends local agent state changes to a remote agent-monitor.
 func startForwarder(url, key string) {
 	hostname, _ := os.Hostname()
@@ -3452,6 +3712,9 @@ curl -sX POST http://localhost:%d/api/webhook \
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
+		if nousCfg := loadNousConfig(); nousCfg != nil && taskStore != nil {
+			go startNousSyncLoop(nousCfg, taskStore, sseHub)
+		}
 		m := initialModel(sharedState, sseHub, taskStore, webhookStore)
 		for {
 			m.agents = detectAgentsSync()
@@ -3476,6 +3739,11 @@ curl -sX POST http://localhost:%d/api/webhook \
 			}
 			time.Sleep(2 * time.Second)
 		}
+	}
+
+	// Start Nous sync if configured
+	if nousCfg := loadNousConfig(); nousCfg != nil && taskStore != nil {
+		go startNousSyncLoop(nousCfg, taskStore, sseHub)
 	}
 
 	// Start forwarder if configured
