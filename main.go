@@ -419,14 +419,16 @@ type SharedState struct {
 	startTime time.Time
 }
 
-func (s *SharedState) Update(agents []Agent, groups []Group) {
+// Update replaces the current state and returns the previous agent list (for diffing).
+func (s *SharedState) Update(agents []Agent, groups []Group) []Agent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Store copies so the TUI can freely replace its own slices
+	prev := s.agents
 	s.agents = make([]Agent, len(agents))
 	copy(s.agents, agents)
 	s.groups = make([]Group, len(groups))
 	copy(s.groups, groups)
+	return prev
 }
 
 func (s *SharedState) GetAgents() []Agent {
@@ -506,8 +508,132 @@ func toAPIGroup(g Group) apiGroup {
 	}
 }
 
+// SSEEvent is a typed event pushed to connected SSE clients.
+type SSEEvent struct {
+	Type string // "agent:update", "agent:added", "agent:removed", "agents:snapshot"
+	Data []byte // JSON payload
+}
+
+// SSEHub manages connected SSE clients and fans out events.
+type SSEHub struct {
+	mu      sync.Mutex
+	clients map[chan SSEEvent]bool
+	state   *SharedState
+}
+
+func newSSEHub(state *SharedState) *SSEHub {
+	return &SSEHub{
+		clients: make(map[chan SSEEvent]bool),
+		state:   state,
+	}
+}
+
+func (h *SSEHub) Register(ch chan SSEEvent) {
+	h.mu.Lock()
+	h.clients[ch] = true
+	h.mu.Unlock()
+}
+
+func (h *SSEHub) Unregister(ch chan SSEEvent) {
+	h.mu.Lock()
+	delete(h.clients, ch)
+	close(ch)
+	h.mu.Unlock()
+}
+
+// Broadcast sends an event to all connected clients. Non-blocking: slow clients are skipped.
+func (h *SSEHub) Broadcast(event SSEEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.clients {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
+}
+
+// HandleEvents is the SSE endpoint handler (GET /api/events).
+func (h *SSEHub) HandleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	ch := make(chan SSEEvent, 64)
+	h.Register(ch)
+	defer h.Unregister(ch)
+
+	// Retry hint for auto-reconnect
+	fmt.Fprintf(w, "retry: 3000\n\n")
+
+	// Initial snapshot
+	agents := h.state.GetAgents()
+	apiAgents := make([]apiAgent, len(agents))
+	for i, a := range agents {
+		apiAgents[i] = toAPIAgent(a)
+	}
+	data, _ := json.Marshal(apiAgents)
+	fmt.Fprintf(w, "event: agents:snapshot\ndata: %s\n\n", data)
+	flusher.Flush()
+
+	// Heartbeat keepalive
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, event.Data)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// diffAgents compares previous and current agent lists and returns SSE events for changes.
+func diffAgents(prev, current []Agent) []SSEEvent {
+	prevMap := make(map[string]Agent)
+	for _, a := range prev {
+		prevMap[a.Target()] = a
+	}
+
+	var events []SSEEvent
+	for _, a := range current {
+		p, existed := prevMap[a.Target()]
+		if !existed {
+			data, _ := json.Marshal(toAPIAgent(a))
+			events = append(events, SSEEvent{Type: "agent:added", Data: data})
+		} else if a.Status != p.Status || a.LastLine != p.LastLine || a.Presence != p.Presence {
+			data, _ := json.Marshal(toAPIAgent(a))
+			events = append(events, SSEEvent{Type: "agent:update", Data: data})
+		}
+		delete(prevMap, a.Target())
+	}
+
+	for _, a := range prevMap {
+		data, _ := json.Marshal(toAPIAgent(a))
+		events = append(events, SSEEvent{Type: "agent:removed", Data: data})
+	}
+
+	return events
+}
+
 // startWebServer launches the HTTP API server on a separate goroutine.
-func startWebServer(port int, state *SharedState) {
+func startWebServer(port int, state *SharedState, hub *SSEHub) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
@@ -529,6 +655,8 @@ func startWebServer(port int, state *SharedState) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
 	})
+
+	mux.HandleFunc("GET /api/events", hub.HandleEvents)
 
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		agents := state.GetAgents()
@@ -592,6 +720,7 @@ type Model struct {
 	gridPaneIDs         [4]string              // tmux pane IDs (%N) for each grid cell
 	gridAgents          [4]string              // agent target in each slot ("" = empty)
 	sharedState         *SharedState           // shared state for HTTP API (nil if --no-web)
+	sseHub              *SSEHub                // SSE event hub (nil if --no-web)
 }
 
 // Messages
@@ -685,7 +814,7 @@ var (
 			Foreground(lipgloss.Color("220")) // yellow star
 )
 
-func initialModel(sharedState *SharedState) Model {
+func initialModel(sharedState *SharedState, sseHub *SSEHub) Model {
 	m := Model{
 		agents:              []Agent{},
 		cursor:              0,
@@ -697,6 +826,7 @@ func initialModel(sharedState *SharedState) Model {
 		planPendingApproval: make(map[string]bool),
 		favorites:           loadFavorites(),
 		sharedState:         sharedState,
+		sseHub:              sseHub,
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -1813,7 +1943,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.buildGroups()
 		if m.sharedState != nil {
-			m.sharedState.Update(m.flatAgents, m.groups)
+			prev := m.sharedState.Update(m.flatAgents, m.groups)
+			if m.sseHub != nil {
+				for _, event := range diffAgents(prev, m.flatAgents) {
+					m.sseHub.Broadcast(event)
+				}
+			}
 		}
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
@@ -2642,7 +2777,7 @@ func main() {
 
 	// List mode: just print agents and exit
 	if *listOnly {
-		m := initialModel(nil)
+		m := initialModel(nil, nil)
 		m.agents = detectAgentsSync()
 		m.buildGroups()
 		agents := m.flatAgents
@@ -2659,15 +2794,17 @@ func main() {
 
 	// Start embedded HTTP server
 	var sharedState *SharedState
+	var sseHub *SSEHub
 	if !*noWeb || *webOnly {
 		sharedState = &SharedState{startTime: time.Now()}
-		go startWebServer(*webPort, sharedState)
+		sseHub = newSSEHub(sharedState)
+		go startWebServer(*webPort, sharedState, sseHub)
 	}
 
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
-		m := initialModel(sharedState)
+		m := initialModel(sharedState, sseHub)
 		for {
 			m.agents = detectAgentsSync()
 			if len(m.config.Groups) > 0 {
@@ -2675,13 +2812,18 @@ func main() {
 			}
 			m.buildGroups()
 			if sharedState != nil {
-				sharedState.Update(m.flatAgents, m.groups)
+				prev := sharedState.Update(m.flatAgents, m.groups)
+				if sseHub != nil {
+					for _, event := range diffAgents(prev, m.flatAgents) {
+						sseHub.Broadcast(event)
+					}
+				}
 			}
 			time.Sleep(2 * time.Second)
 		}
 	}
 
-	p := tea.NewProgram(initialModel(sharedState), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(initialModel(sharedState, sseHub), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
