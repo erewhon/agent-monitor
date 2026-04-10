@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,6 +44,9 @@ var (
 	webPort           = flag.Int("web-port", 8070, "HTTP API port")
 	noWeb             = flag.Bool("no-web", false, "Disable embedded HTTP server")
 	webOnly           = flag.Bool("web-only", false, "Run HTTP server only, no TUI")
+	webhookKey        = flag.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
+	forwardURL        = flag.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
+	forwardKey        = flag.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -853,11 +859,12 @@ func (ts *TaskStore) AutoLink(agents []Agent, hub *SSEHub) {
 
 // WebhookState holds the last push-based state for an agent session.
 type WebhookState struct {
-	Session   string      `json:"session"`
-	AgentType string      `json:"agent_type"`
-	Status    string      `json:"status"`
-	Detail    string      `json:"detail,omitempty"`
-	Timestamp time.Time   `json:"timestamp"`
+	Session   string    `json:"session"`
+	AgentType string    `json:"agent_type"`
+	Status    string    `json:"status"`
+	Detail    string    `json:"detail,omitempty"`
+	Host      string    `json:"host,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // WebhookStore tracks push-based agent state from hooks.
@@ -890,6 +897,37 @@ func (ws *WebhookStore) Get(session string) (WebhookState, bool) {
 		return WebhookState{}, false
 	}
 	return state, true
+}
+
+// GetRemoteAgents returns synthetic Agent entries for remote webhook sources (with Host set).
+func (ws *WebhookStore) GetRemoteAgents() []Agent {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	var agents []Agent
+	for _, state := range ws.states {
+		if state.Host == "" || time.Since(state.Timestamp) > webhookTTL {
+			continue
+		}
+		agents = append(agents, Agent{
+			Name:      state.Host + "/" + state.Session,
+			Session:   state.Session,
+			Type:      parseWebhookAgentType(state.AgentType),
+			Status:    parseWebhookStatus(state.Status),
+			Presence:  PresenceActive,
+			LastLine:  state.Detail,
+			UpdatedAt: state.Timestamp,
+		})
+	}
+	return agents
+}
+
+// isLocalhost checks if the request comes from a loopback address.
+func isLocalhost(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
 // parseWebhookStatus converts a webhook status string to AgentStatus.
@@ -943,6 +981,79 @@ func mergeWebhookState(agents []Agent, ws *WebhookStore) {
 		if state.Detail != "" {
 			agents[i].LastLine = state.Detail
 		}
+	}
+}
+
+// startForwarder periodically sends local agent state changes to a remote agent-monitor.
+func startForwarder(url, key string) {
+	hostname, _ := os.Hostname()
+	prevState := make(map[string]Agent)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for {
+		agents := detectAgentsSync()
+		currentState := make(map[string]Agent)
+		for _, a := range agents {
+			if a.Presence == PresenceActive {
+				currentState[a.Target()] = a
+			}
+		}
+
+		for target, a := range currentState {
+			prev, existed := prevState[target]
+			if !existed || prev.Status != a.Status || prev.LastLine != a.LastLine {
+				payload := WebhookState{
+					Session:   a.Session,
+					AgentType: string(a.Type),
+					Status:    a.Status.String(),
+					Detail:    a.LastLine,
+					Host:      hostname,
+				}
+				data, _ := json.Marshal(payload)
+				req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+				if err != nil {
+					continue
+				}
+				req.Header.Set("Content-Type", "application/json")
+				if key != "" {
+					req.Header.Set("Authorization", "Bearer "+key)
+				}
+				resp, err := client.Do(req)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
+
+		// Send removals for agents that disappeared
+		for target, a := range prevState {
+			if _, exists := currentState[target]; !exists {
+				payload := WebhookState{
+					Session:   a.Session,
+					AgentType: string(a.Type),
+					Status:    "idle",
+					Host:      hostname,
+				}
+				data, _ := json.Marshal(payload)
+				req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+				if err != nil {
+					continue
+				}
+				req.Header.Set("Content-Type", "application/json")
+				if key != "" {
+					req.Header.Set("Authorization", "Bearer "+key)
+				}
+				resp, err := client.Do(req)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
+
+		prevState = currentState
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -1060,6 +1171,18 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 
 	// Webhook endpoint for push-based agent state
 	mux.HandleFunc("POST /api/webhook", func(w http.ResponseWriter, r *http.Request) {
+		// Auth required for non-localhost when webhook-key is set
+		key := *webhookKey
+		if key == "" {
+			key = os.Getenv("AGENT_MONITOR_WEBHOOK_KEY")
+		}
+		if key != "" && !isLocalhost(r) {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+key {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
 		var state WebhookState
 		if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -2257,6 +2380,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agents = []Agent(msg)
 		// Merge push-based webhook state (overrides scraping when fresh)
 		mergeWebhookState(m.agents, m.webhookStore)
+		// Inject remote agents from webhook sources
+		if m.webhookStore != nil {
+			m.agents = append(m.agents, m.webhookStore.GetRemoteAgents()...)
+		}
 		// Detect transitions with debouncing: a status change must persist
 		// for 2 consecutive polls before triggering notifications. This
 		// prevents spurious alerts when detection briefly flickers (e.g.
@@ -3236,6 +3363,14 @@ var keys = keyMap{
 func main() {
 	flag.Parse()
 
+	// Subcommand: webhook-key generate
+	if len(flag.Args()) >= 2 && flag.Args()[0] == "webhook-key" && flag.Args()[1] == "generate" {
+		b := make([]byte, 32)
+		rand.Read(b)
+		fmt.Println(base64.URLEncoding.EncodeToString(b))
+		return
+	}
+
 	// Subcommand: hooks install
 	if len(flag.Args()) >= 2 && flag.Args()[0] == "hooks" && flag.Args()[1] == "install" {
 		port := *webPort
@@ -3321,6 +3456,9 @@ curl -sX POST http://localhost:%d/api/webhook \
 		for {
 			m.agents = detectAgentsSync()
 			mergeWebhookState(m.agents, webhookStore)
+			if webhookStore != nil {
+				m.agents = append(m.agents, webhookStore.GetRemoteAgents()...)
+			}
 			if len(m.config.Groups) > 0 {
 				m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 			}
@@ -3338,6 +3476,11 @@ curl -sX POST http://localhost:%d/api/webhook \
 			}
 			time.Sleep(2 * time.Second)
 		}
+	}
+
+	// Start forwarder if configured
+	if *forwardURL != "" {
+		go startForwarder(*forwardURL, *forwardKey)
 	}
 
 	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore), tea.WithAltScreen(), tea.WithMouseCellMotion())
