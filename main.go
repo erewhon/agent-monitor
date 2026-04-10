@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -632,8 +633,224 @@ func diffAgents(prev, current []Agent) []SSEEvent {
 	return events
 }
 
+// TaskColumn represents a Kanban column.
+type TaskColumn string
+
+const (
+	ColumnBacklog    TaskColumn = "backlog"
+	ColumnActive     TaskColumn = "active"
+	ColumnNeedsInput TaskColumn = "needs_input"
+	ColumnDone       TaskColumn = "done"
+	ColumnArchived   TaskColumn = "archived"
+)
+
+// Task is a persistent Kanban card.
+type Task struct {
+	ID          int        `json:"id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description,omitempty"`
+	Column      TaskColumn `json:"column"`
+	SessionName string     `json:"session_name,omitempty"`
+	Group       string     `json:"group,omitempty"`
+	NousPageID  string     `json:"nous_page_id,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+type taskPatchRequest struct {
+	Title       *string     `json:"title,omitempty"`
+	Description *string     `json:"description,omitempty"`
+	Column      *TaskColumn `json:"column,omitempty"`
+	SessionName *string     `json:"session_name,omitempty"`
+	Group       *string     `json:"group,omitempty"`
+	NousPageID  *string     `json:"nous_page_id,omitempty"`
+}
+
+type taskStoreData struct {
+	NextID int    `json:"next_id"`
+	Tasks  []Task `json:"tasks"`
+}
+
+// TaskStore provides persistent CRUD for Kanban tasks backed by a JSON file.
+type TaskStore struct {
+	mu   sync.RWMutex
+	data taskStoreData
+	path string
+}
+
+func tasksPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agent-monitor", "tasks.json")
+}
+
+func newTaskStore() *TaskStore {
+	path := tasksPath()
+	ts := &TaskStore{path: path, data: taskStoreData{NextID: 1}}
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			json.Unmarshal(data, &ts.data)
+		}
+	}
+	return ts
+}
+
+func (ts *TaskStore) saveLocked() {
+	if ts.path == "" {
+		return
+	}
+	data, err := json.MarshalIndent(ts.data, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(ts.path, data, 0644)
+}
+
+func (ts *TaskStore) List(includeArchived bool) []Task {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	var result []Task
+	for _, t := range ts.data.Tasks {
+		if !includeArchived && t.Column == ColumnArchived {
+			continue
+		}
+		result = append(result, t)
+	}
+	return result
+}
+
+func (ts *TaskStore) Get(id int) (Task, bool) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for _, t := range ts.data.Tasks {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return Task{}, false
+}
+
+func (ts *TaskStore) Create(title, description, sessionName, group string) Task {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	task := Task{
+		ID:          ts.data.NextID,
+		Title:       title,
+		Column:      ColumnBacklog,
+		Description: description,
+		SessionName: sessionName,
+		Group:       group,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	ts.data.NextID++
+	ts.data.Tasks = append(ts.data.Tasks, task)
+	ts.saveLocked()
+	return task
+}
+
+func (ts *TaskStore) Update(id int, patch taskPatchRequest) (Task, bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for i := range ts.data.Tasks {
+		if ts.data.Tasks[i].ID != id {
+			continue
+		}
+		t := &ts.data.Tasks[i]
+		if patch.Title != nil {
+			t.Title = *patch.Title
+		}
+		if patch.Description != nil {
+			t.Description = *patch.Description
+		}
+		if patch.Column != nil {
+			t.Column = *patch.Column
+		}
+		if patch.SessionName != nil {
+			t.SessionName = *patch.SessionName
+		}
+		if patch.Group != nil {
+			t.Group = *patch.Group
+		}
+		if patch.NousPageID != nil {
+			t.NousPageID = *patch.NousPageID
+		}
+		t.UpdatedAt = time.Now()
+		ts.saveLocked()
+		return *t, true
+	}
+	return Task{}, false
+}
+
+func (ts *TaskStore) Delete(id int) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for i := range ts.data.Tasks {
+		if ts.data.Tasks[i].ID == id {
+			ts.data.Tasks = append(ts.data.Tasks[:i], ts.data.Tasks[i+1:]...)
+			ts.saveLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// AutoLink updates task columns based on live agent status.
+// Tasks with a session_name matching an active agent auto-move between columns.
+func (ts *TaskStore) AutoLink(agents []Agent, hub *SSEHub) {
+	agentMap := make(map[string]Agent)
+	for _, a := range agents {
+		if a.Presence == PresenceActive {
+			agentMap[a.Session] = a
+		}
+	}
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	changed := false
+	for i := range ts.data.Tasks {
+		t := &ts.data.Tasks[i]
+		if t.SessionName == "" || t.Column == ColumnArchived {
+			continue
+		}
+		agent, linked := agentMap[t.SessionName]
+		if !linked {
+			continue
+		}
+
+		var newColumn TaskColumn
+		switch agent.Status {
+		case StatusRunning, StatusPlanning:
+			newColumn = ColumnActive
+		case StatusWaiting:
+			newColumn = ColumnNeedsInput
+		case StatusIdle:
+			if t.Column == ColumnActive || t.Column == ColumnNeedsInput {
+				newColumn = ColumnDone
+			}
+		}
+
+		if newColumn != "" && newColumn != t.Column {
+			t.Column = newColumn
+			t.UpdatedAt = time.Now()
+			changed = true
+			if hub != nil {
+				data, _ := json.Marshal(t)
+				hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
+			}
+		}
+	}
+
+	if changed {
+		ts.saveLocked()
+	}
+}
+
 // startWebServer launches the HTTP API server on a separate goroutine.
-func startWebServer(port int, state *SharedState, hub *SSEHub) {
+func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/agents", func(w http.ResponseWriter, r *http.Request) {
@@ -657,6 +874,83 @@ func startWebServer(port int, state *SharedState, hub *SSEHub) {
 	})
 
 	mux.HandleFunc("GET /api/events", hub.HandleEvents)
+
+	// Task CRUD endpoints
+	mux.HandleFunc("GET /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		includeArchived := r.URL.Query().Get("include_archived") == "true"
+		result := tasks.List(includeArchived)
+		if result == nil {
+			result = []Task{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	mux.HandleFunc("POST /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			SessionName string `json:"session_name"`
+			Group       string `json:"group"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Title == "" {
+			http.Error(w, "title required", http.StatusBadRequest)
+			return
+		}
+		task := tasks.Create(req.Title, req.Description, req.SessionName, req.Group)
+		if hub != nil {
+			data, _ := json.Marshal(task)
+			hub.Broadcast(SSEEvent{Type: "task:created", Data: data})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(task)
+	})
+
+	mux.HandleFunc("PATCH /api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		var patch taskPatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		task, ok := tasks.Update(id, patch)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if hub != nil {
+			data, _ := json.Marshal(task)
+			hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(task)
+	})
+
+	mux.HandleFunc("DELETE /api/tasks/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		if !tasks.Delete(id) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if hub != nil {
+			data, _ := json.Marshal(map[string]int{"id": id})
+			hub.Broadcast(SSEEvent{Type: "task:deleted", Data: data})
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		agents := state.GetAgents()
@@ -721,6 +1015,7 @@ type Model struct {
 	gridAgents          [4]string              // agent target in each slot ("" = empty)
 	sharedState         *SharedState           // shared state for HTTP API (nil if --no-web)
 	sseHub              *SSEHub                // SSE event hub (nil if --no-web)
+	taskStore           *TaskStore             // persistent task storage (nil if --no-web)
 }
 
 // Messages
@@ -814,7 +1109,7 @@ var (
 			Foreground(lipgloss.Color("220")) // yellow star
 )
 
-func initialModel(sharedState *SharedState, sseHub *SSEHub) Model {
+func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore) Model {
 	m := Model{
 		agents:              []Agent{},
 		cursor:              0,
@@ -827,6 +1122,7 @@ func initialModel(sharedState *SharedState, sseHub *SSEHub) Model {
 		favorites:           loadFavorites(),
 		sharedState:         sharedState,
 		sseHub:              sseHub,
+		taskStore:           taskStore,
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -1950,6 +2246,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		if m.taskStore != nil {
+			m.taskStore.AutoLink(m.flatAgents, m.sseHub)
+		}
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
 		}
@@ -2777,7 +3076,7 @@ func main() {
 
 	// List mode: just print agents and exit
 	if *listOnly {
-		m := initialModel(nil, nil)
+		m := initialModel(nil, nil, nil)
 		m.agents = detectAgentsSync()
 		m.buildGroups()
 		agents := m.flatAgents
@@ -2795,16 +3094,18 @@ func main() {
 	// Start embedded HTTP server
 	var sharedState *SharedState
 	var sseHub *SSEHub
+	var taskStore *TaskStore
 	if !*noWeb || *webOnly {
 		sharedState = &SharedState{startTime: time.Now()}
 		sseHub = newSSEHub(sharedState)
-		go startWebServer(*webPort, sharedState, sseHub)
+		taskStore = newTaskStore()
+		go startWebServer(*webPort, sharedState, sseHub, taskStore)
 	}
 
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
-		m := initialModel(sharedState, sseHub)
+		m := initialModel(sharedState, sseHub, taskStore)
 		for {
 			m.agents = detectAgentsSync()
 			if len(m.config.Groups) > 0 {
@@ -2819,11 +3120,14 @@ func main() {
 					}
 				}
 			}
+			if taskStore != nil {
+				taskStore.AutoLink(m.flatAgents, sseHub)
+			}
 			time.Sleep(2 * time.Second)
 		}
 	}
 
-	p := tea.NewProgram(initialModel(sharedState, sseHub), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
