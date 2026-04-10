@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"os"
@@ -849,6 +851,15 @@ func (ts *TaskStore) AutoLink(agents []Agent, hub *SSEHub) {
 	}
 }
 
+//go:embed web/board.html
+var boardHTML string
+
+type boardData struct {
+	AgentCount int
+	Groups     []string
+	Version    string
+}
+
 // startWebServer launches the HTTP API server on a separate goroutine.
 func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore) {
 	mux := http.NewServeMux()
@@ -964,6 +975,33 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
+	})
+
+	// Board UI
+	boardTmpl := template.Must(template.New("board").Parse(boardHTML))
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		agents := state.GetAgents()
+		activeCount := 0
+		for _, a := range agents {
+			if a.Presence == PresenceActive {
+				activeCount++
+			}
+		}
+		groups := state.GetGroups()
+		var groupNames []string
+		seen := make(map[string]bool)
+		for _, g := range groups {
+			if g.Name != "" && !seen[g.Name] {
+				groupNames = append(groupNames, g.Name)
+				seen[g.Name] = true
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		boardTmpl.Execute(w, boardData{
+			AgentCount: activeCount,
+			Groups:     groupNames,
+			Version:    version,
+		})
 	})
 
 	// CORS middleware
