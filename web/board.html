@@ -93,13 +93,93 @@
       color: #fff;
     }
 
+    .main-layout {
+      display: flex;
+      gap: 0;
+      min-height: calc(100vh - 100px);
+    }
+
     .board {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
       gap: 12px;
       padding: 12px 20px;
-      min-height: calc(100vh - 100px);
+      flex: 1;
       align-items: start;
+    }
+
+    .agents-panel {
+      width: 240px;
+      min-width: 240px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      padding: 0;
+      overflow-y: auto;
+    }
+
+    .agents-panel-header {
+      padding: 10px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      background: var(--surface);
+      z-index: 1;
+    }
+
+    .agents-list {
+      padding: 6px;
+    }
+
+    .agent-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      transition: background 0.1s;
+    }
+
+    .agent-item:hover {
+      background: var(--surface2);
+    }
+
+    .agent-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .agent-activity {
+      font-size: 10px;
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 0 8px 4px 28px;
+      margin-top: -2px;
+    }
+
+    .agent-group-header {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--accent);
+      padding: 8px 8px 4px;
+      margin-top: 4px;
+    }
+
+    .agent-group-header:first-child {
+      margin-top: 0;
     }
 
     .column {
@@ -346,7 +426,13 @@
     .connection-status.connected { background: var(--status-running); }
     .connection-status.disconnected { background: var(--status-error); }
 
+    @media (max-width: 1100px) {
+      .agents-panel { width: 200px; min-width: 200px; }
+    }
+
     @media (max-width: 900px) {
+      .main-layout { flex-direction: column; }
+      .agents-panel { width: 100%; min-width: 100%; max-height: 200px; border-left: none; border-top: 1px solid var(--border); }
       .board { grid-template-columns: repeat(2, 1fr); }
     }
 
@@ -375,6 +461,7 @@
     </select>
   </div>
 
+  <div class="main-layout">
   <div class="board">
     <div class="column" data-column="backlog">
       <div class="column-header">
@@ -404,6 +491,15 @@
       </div>
       <div class="cards" id="col-done"></div>
     </div>
+  </div>
+
+  <div class="agents-panel">
+    <div class="agents-panel-header">
+      <span>Agents</span>
+      <span class="column-count" id="agent-panel-count">0</span>
+    </div>
+    <div class="agents-list" id="agents-list"></div>
+  </div>
   </div>
 
   <!-- Create Task Modal -->
@@ -491,6 +587,39 @@
       return html;
     }
 
+    // Render agents panel
+    function renderAgentsPanel() {
+      const list = document.getElementById('agents-list');
+      const activeAgents = Object.values(agents)
+        .filter(a => a.presence === 'active')
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      document.getElementById('agent-panel-count').textContent = activeAgents.length;
+
+      if (activeAgents.length === 0) {
+        list.innerHTML = '<div style="padding:12px;color:var(--text-dim);font-size:11px">No active agents</div>';
+        return;
+      }
+
+      // Group agents by their group (from the /api/groups data if available)
+      let html = '';
+      activeAgents.forEach(a => {
+        const statusClass = 'status-' + (a.status || 'unknown');
+        html += '<div class="agent-item">';
+        html += '<span class="status-dot ' + statusClass + '"></span>';
+        if (a.badge) {
+          html += '<span class="badge ' + badgeClass(a.badge) + '">' + a.badge + '</span>';
+        }
+        html += '<span class="agent-name">' + escapeHtml(a.name) + '</span>';
+        html += '</div>';
+        if (a.last_line) {
+          html += '<div class="agent-activity">' + escapeHtml(a.last_line) + '</div>';
+        }
+      });
+
+      list.innerHTML = html;
+    }
+
     // Re-render all columns
     function renderBoard() {
       const counts = {};
@@ -541,24 +670,28 @@
         list.forEach(a => { if (a.session) agents[a.session] = a; });
         document.getElementById('agent-count').textContent = list.filter(a => a.presence === 'active').length + ' agents';
         renderBoard();
+        renderAgentsPanel();
       });
 
       source.addEventListener('agent:update', (e) => {
         const a = JSON.parse(e.data);
         if (a.session) agents[a.session] = a;
         renderBoard();
+        renderAgentsPanel();
       });
 
       source.addEventListener('agent:added', (e) => {
         const a = JSON.parse(e.data);
         if (a.session) agents[a.session] = a;
         renderBoard();
+        renderAgentsPanel();
       });
 
       source.addEventListener('agent:removed', (e) => {
         const a = JSON.parse(e.data);
         if (a.session) delete agents[a.session];
         renderBoard();
+        renderAgentsPanel();
       });
 
       source.addEventListener('task:created', (e) => {
