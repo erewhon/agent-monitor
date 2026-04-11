@@ -1131,6 +1131,22 @@ func (c *NousClient) appendToPage(pageID, content string) error {
 	return nil
 }
 
+// inferProjectFromTags returns the most likely project name from a page's tags
+// by filtering out known meta-tags.
+func inferProjectFromTags(tags []string) string {
+	skip := map[string]bool{
+		"task": true, "done": true, "ready": true, "in-progress": true,
+		"kanban": true, "feature": true, "plan": true, "orchestration": true,
+		"workflow": true, "spec-needed": true,
+	}
+	for _, tag := range tags {
+		if !skip[tag] {
+			return tag
+		}
+	}
+	return ""
+}
+
 // hasTag checks if a page has a specific tag.
 func hasTag(page nousPage, tag string) bool {
 	for _, t := range page.Tags {
@@ -1255,9 +1271,10 @@ func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
 				}
 				if knownPages[page.ID] {
 					for _, t := range tasks.List(false) {
-						if t.NousPageID == page.ID && t.Title != page.Title {
+						newGroup := inferProjectFromTags(page.Tags)
+						if t.NousPageID == page.ID && (t.Title != page.Title || t.Group != newGroup) {
 							title := page.Title
-							tasks.Update(t.ID, taskPatchRequest{Title: &title})
+							tasks.Update(t.ID, taskPatchRequest{Title: &title, Group: &newGroup})
 							if hub != nil {
 								updated, _ := tasks.Get(t.ID)
 								data, _ := json.Marshal(updated)
@@ -1267,7 +1284,8 @@ func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
 					}
 					continue
 				}
-				task := tasks.Create(page.Title, "", "", "")
+				group := inferProjectFromTags(page.Tags)
+				task := tasks.Create(page.Title, "", "", group)
 				nousID := page.ID
 				tasks.Update(task.ID, taskPatchRequest{NousPageID: &nousID})
 				knownPages[page.ID] = true

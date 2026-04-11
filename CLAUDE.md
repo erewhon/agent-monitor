@@ -45,6 +45,17 @@ Single-file Go TUI (`main.go`) using the [Bubble Tea](https://github.com/charmbr
 - `agent-monitor-placeholder` — placeholder display for the right pane before an agent is selected
 - `focus-agent-monitor` — helper to return focus from inner tmux to the monitor pane
 
+## Task Management
+
+Task specs and feature specs live in the **Forge** notebook in Nous. When working on a task:
+
+- Use `mcp__nous__get_page` to read the task spec from Forge (e.g., "Task: Kanban Board Web UI")
+- Use `mcp__nous__get_database` on the "Project Tasks" database in Forge to see status and dependencies
+- Update task status via `mcp__nous__update_database_rows` in the Project Tasks database (not internal task tools)
+- Feature pages in Forge contain the full context: data model, API contracts, edge cases, test plans
+
+Do NOT create ad-hoc task tracking internally — all task state lives in Forge.
+
 ## Version Control
 
 This repo uses **jj** (Jujutsu), not git.
