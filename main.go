@@ -1113,6 +1113,165 @@ func (c *NousClient) updateTags(pageID string, tags []string) error {
 	return nil
 }
 
+// nousDatabase represents a Nous database with rows and schema.
+type nousDatabase struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Database struct {
+		Properties []nousProperty `json:"properties"`
+		Rows       []nousRow      `json:"rows"`
+	} `json:"database"`
+}
+
+type nousProperty struct {
+	ID      string           `json:"id"`
+	Name    string           `json:"name"`
+	Type    string           `json:"type"`
+	Options []nousOption     `json:"options,omitempty"`
+}
+
+type nousOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type nousRow struct {
+	ID    string         `json:"id"`
+	Cells map[string]any `json:"cells"`
+}
+
+// nousTaskRow is a parsed row from the Project Tasks database.
+type nousTaskRow struct {
+	RowID   string
+	Task    string
+	Project string
+	Status  string
+	Feature string
+}
+
+func (c *NousClient) listDatabases() ([]struct{ ID, Title string }, error) {
+	if err := c.resolveNotebookID(); err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var env nousEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, err
+	}
+	var dbs []struct{ ID, Title string }
+	json.Unmarshal(env.Data, &dbs)
+	return dbs, nil
+}
+
+func (c *NousClient) getDatabase(dbID string) (*nousDatabase, error) {
+	if err := c.resolveNotebookID(); err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases/" + dbID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var env nousEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, err
+	}
+	var db nousDatabase
+	if err := json.Unmarshal(env.Data, &db); err != nil {
+		return nil, err
+	}
+	return &db, nil
+}
+
+// getTaskRows finds the "Project Tasks" database and returns parsed rows.
+func (c *NousClient) getTaskRows() ([]nousTaskRow, error) {
+	dbs, err := c.listDatabases()
+	if err != nil {
+		return nil, err
+	}
+	var dbID string
+	for _, db := range dbs {
+		if db.Title == "Project Tasks" {
+			dbID = db.ID
+			break
+		}
+	}
+	if dbID == "" {
+		return nil, fmt.Errorf("Project Tasks database not found")
+	}
+
+	db, err := c.getDatabase(dbID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build property name → ID map
+	propByName := make(map[string]string) // name → property UUID
+	for _, p := range db.Database.Properties {
+		propByName[p.Name] = p.ID
+	}
+
+	// Build option UUID → label map for select properties
+	optionLabels := make(map[string]string) // option UUID → label
+	for _, p := range db.Database.Properties {
+		for _, opt := range p.Options {
+			optionLabels[opt.ID] = opt.Label
+		}
+	}
+
+	// Helper to get a cell value, resolving select UUIDs to labels
+	cellStr := func(cells map[string]any, propName string) string {
+		propID, ok := propByName[propName]
+		if !ok {
+			return ""
+		}
+		val, ok := cells[propID]
+		if !ok || val == nil {
+			return ""
+		}
+		s, ok := val.(string)
+		if !ok {
+			return ""
+		}
+		// If this looks like a UUID and we have a label for it, resolve it
+		if label, found := optionLabels[s]; found {
+			return label
+		}
+		return s
+	}
+
+	var rows []nousTaskRow
+	for _, row := range db.Database.Rows {
+		tr := nousTaskRow{
+			RowID:   row.ID,
+			Task:    cellStr(row.Cells, "Task"),
+			Project: cellStr(row.Cells, "Project"),
+			Status:  cellStr(row.Cells, "Status"),
+			Feature: cellStr(row.Cells, "Feature"),
+		}
+		if tr.Task != "" {
+			rows = append(rows, tr)
+		}
+	}
+	return rows, nil
+}
+
+// nousStatusToColumn maps a Nous task status to a Kanban column.
+func nousStatusToColumn(status string) TaskColumn {
+	switch status {
+	case "In Progress":
+		return ColumnActive
+	case "Done":
+		return ColumnDone
+	default: // "Ready", "Spec Needed", ""
+		return ColumnBacklog
+	}
+}
+
 func (c *NousClient) appendToPage(pageID, content string) error {
 	if err := c.resolveNotebookID(); err != nil {
 		return err
@@ -1293,6 +1452,53 @@ func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
 					updated, _ := tasks.Get(task.ID)
 					data, _ := json.Marshal(updated)
 					hub.Broadcast(SSEEvent{Type: "task:created", Data: data})
+				}
+			}
+
+			// --- Nous Database → Board (status + project sync) ---
+			dbRows, dbErr := nous.getTaskRows()
+			if dbErr == nil {
+				// Build lookup: normalized task name → database row
+				// Strip "Task: " prefix for matching
+				rowByName := make(map[string]nousTaskRow)
+				for _, row := range dbRows {
+					rowByName[row.Task] = row
+				}
+
+				for _, t := range tasks.List(true) {
+					// Normalize task title for matching: strip "Task: " prefix
+					name := strings.TrimPrefix(t.Title, "Task: ")
+					row, found := rowByName[name]
+					if !found {
+						// Try exact title match
+						row, found = rowByName[t.Title]
+					}
+					if !found {
+						continue
+					}
+
+					newGroup := row.Project
+					newCol := nousStatusToColumn(row.Status)
+					needsUpdate := false
+					patch := taskPatchRequest{}
+
+					if newGroup != "" && newGroup != t.Group {
+						patch.Group = &newGroup
+						needsUpdate = true
+					}
+					if newCol != t.Column {
+						patch.Column = &newCol
+						needsUpdate = true
+					}
+
+					if needsUpdate {
+						tasks.Update(t.ID, patch)
+						if hub != nil {
+							updated, _ := tasks.Get(t.ID)
+							data, _ := json.Marshal(updated)
+							hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
+						}
+					}
 				}
 			}
 
