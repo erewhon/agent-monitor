@@ -100,12 +100,104 @@
     }
 
     .board {
+      flex: 1;
+      padding: 12px 20px;
+      overflow-y: auto;
+    }
+
+    .board-header {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-      padding: 12px 20px;
+      gap: 8px;
+      margin-bottom: 8px;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--bg);
+      padding-bottom: 4px;
+    }
+
+    .board-header-col {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      padding: 6px 8px;
+      text-align: center;
+    }
+
+    .board-header-col[data-column="backlog"] { border-top: 3px solid var(--col-backlog); }
+    .board-header-col[data-column="active"] { border-top: 3px solid var(--col-active); }
+    .board-header-col[data-column="needs_input"] { border-top: 3px solid var(--col-needs-input); }
+    .board-header-col[data-column="done"] { border-top: 3px solid var(--col-done); }
+
+    .swim-lane {
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+    }
+
+    .swim-lane-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      font-weight: 600;
+      border-bottom: 1px solid transparent;
+    }
+
+    .swim-lane:not(.collapsed) .swim-lane-header {
+      border-bottom-color: var(--border);
+    }
+
+    .swim-lane-header:hover {
+      background: var(--surface2);
+      border-radius: 6px;
+    }
+
+    .collapse-icon {
+      font-size: 10px;
+      color: var(--text-dim);
+      transition: transform 0.15s;
+      width: 12px;
+      text-align: center;
+    }
+
+    .swim-lane.collapsed .collapse-icon {
+      transform: rotate(-90deg);
+    }
+
+    .swim-lane-name {
+      color: var(--accent);
       flex: 1;
-      align-items: start;
+    }
+
+    .swim-lane-count {
+      background: var(--surface2);
+      border-radius: 10px;
+      padding: 1px 7px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .swim-lane-body {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      padding: 6px;
+    }
+
+    .swim-lane.collapsed .swim-lane-body {
+      display: none;
+    }
+
+    .swim-col {
+      min-height: 20px;
     }
 
     .agents-panel {
@@ -181,30 +273,6 @@
     .agent-group-header:first-child {
       margin-top: 0;
     }
-
-    .column {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      min-height: 200px;
-    }
-
-    .column-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-
-    .column[data-column="backlog"] .column-header { border-top: 3px solid var(--col-backlog); border-radius: 8px 8px 0 0; }
-    .column[data-column="active"] .column-header { border-top: 3px solid var(--col-active); border-radius: 8px 8px 0 0; }
-    .column[data-column="needs_input"] .column-header { border-top: 3px solid var(--col-needs-input); border-radius: 8px 8px 0 0; }
-    .column[data-column="done"] .column-header { border-top: 3px solid var(--col-done); border-radius: 8px 8px 0 0; }
 
     .column-count {
       background: var(--surface2);
@@ -433,11 +501,11 @@
     @media (max-width: 900px) {
       .main-layout { flex-direction: column; }
       .agents-panel { width: 100%; min-width: 100%; max-height: 200px; border-left: none; border-top: 1px solid var(--border); }
-      .board { grid-template-columns: repeat(2, 1fr); }
+      .board-header, .swim-lane-body { grid-template-columns: repeat(2, 1fr); }
     }
 
     @media (max-width: 500px) {
-      .board { grid-template-columns: 1fr; }
+      .board-header, .swim-lane-body { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -463,34 +531,13 @@
 
   <div class="main-layout">
   <div class="board">
-    <div class="column" data-column="backlog">
-      <div class="column-header">
-        <span>Backlog</span>
-        <span class="column-count" id="count-backlog">0</span>
-      </div>
-      <div class="cards" id="col-backlog"></div>
+    <div class="board-header">
+      <div class="board-header-col" data-column="backlog">Backlog</div>
+      <div class="board-header-col" data-column="active">Active</div>
+      <div class="board-header-col" data-column="needs_input">Needs Input</div>
+      <div class="board-header-col" data-column="done">Done</div>
     </div>
-    <div class="column" data-column="active">
-      <div class="column-header">
-        <span>Active</span>
-        <span class="column-count" id="count-active">0</span>
-      </div>
-      <div class="cards" id="col-active"></div>
-    </div>
-    <div class="column" data-column="needs_input">
-      <div class="column-header">
-        <span>Needs Input</span>
-        <span class="column-count" id="count-needs_input">0</span>
-      </div>
-      <div class="cards" id="col-needs_input"></div>
-    </div>
-    <div class="column" data-column="done">
-      <div class="column-header">
-        <span>Done</span>
-        <span class="column-count" id="count-done">0</span>
-      </div>
-      <div class="cards" id="col-done"></div>
-    </div>
+    <div id="swim-lanes"></div>
   </div>
 
   <div class="agents-panel">
@@ -620,17 +667,26 @@
       list.innerHTML = html;
     }
 
-    // Re-render all columns
+    // Get collapsed lanes from localStorage
+    function getCollapsedLanes() {
+      try { return JSON.parse(localStorage.getItem('collapsed-lanes') || '{}'); }
+      catch { return {}; }
+    }
+
+    function toggleLane(project) {
+      const collapsed = getCollapsedLanes();
+      collapsed[project] = !collapsed[project];
+      localStorage.setItem('collapsed-lanes', JSON.stringify(collapsed));
+      renderBoard();
+    }
+
+    // Re-render board with swim lanes
     function renderBoard() {
-      const counts = {};
-      columns.forEach(col => { counts[col] = 0; });
+      const container = document.getElementById('swim-lanes');
+      const collapsed = getCollapsedLanes();
 
-      // Clear columns
-      columns.forEach(col => {
-        document.getElementById('col-' + col).innerHTML = '';
-      });
-
-      // Sort tasks by updated_at descending within each column
+      // Group tasks by project
+      const byProject = {};
       const taskList = Object.values(tasks).sort((a, b) =>
         new Date(b.updated_at) - new Date(a.updated_at)
       );
@@ -638,17 +694,50 @@
       taskList.forEach(task => {
         if (task.column === 'archived') return;
         if (currentGroupFilter && task.group !== currentGroupFilter) return;
-        const col = document.getElementById('col-' + task.column);
-        if (!col) return;
-        col.insertAdjacentHTML('beforeend', renderCard(task));
-        counts[task.column] = (counts[task.column] || 0) + 1;
+        const project = task.group || 'Ungrouped';
+        if (!byProject[project]) byProject[project] = [];
+        byProject[project].push(task);
       });
 
-      // Update counts
-      columns.forEach(col => {
-        const el = document.getElementById('count-' + col);
-        if (el) el.textContent = counts[col];
+      // Sort projects alphabetically, but "Ungrouped" last
+      const projects = Object.keys(byProject).sort((a, b) => {
+        if (a === 'Ungrouped') return 1;
+        if (b === 'Ungrouped') return -1;
+        return a.localeCompare(b);
       });
+
+      let html = '';
+      projects.forEach(project => {
+        const projectTasks = byProject[project];
+        const isCollapsed = collapsed[project];
+        const taskCount = projectTasks.length;
+
+        html += '<div class="swim-lane' + (isCollapsed ? ' collapsed' : '') + '">';
+        html += '<div class="swim-lane-header" onclick="toggleLane(\'' + escapeHtml(project) + '\')">';
+        html += '<span class="collapse-icon">▼</span>';
+        html += '<span class="swim-lane-name">' + escapeHtml(project) + '</span>';
+        html += '<span class="swim-lane-count">' + taskCount + '</span>';
+        html += '</div>';
+        html += '<div class="swim-lane-body">';
+
+        columns.forEach(col => {
+          html += '<div class="swim-col">';
+          projectTasks.forEach(task => {
+            if (task.column === col) {
+              html += renderCard(task);
+            }
+          });
+          html += '</div>';
+        });
+
+        html += '</div></div>';
+      });
+
+      if (projects.length === 0) {
+        html = '<div style="padding:20px;color:var(--text-dim);font-size:13px;text-align:center">No tasks yet. Create one or wait for Nous sync.</div>';
+      }
+
+      container.innerHTML = html;
     }
 
     // SSE connection
