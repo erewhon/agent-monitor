@@ -59,8 +59,16 @@ This creates an outer tmux session with:
 | `k` / `↑` | Move cursor up |
 | `Enter` | Attach selected agent to right pane |
 | `l` / `→` | Focus the right pane |
+| `s` | Toggle group-by-status (bucket agents by Waiting/Error/Running/Planning/Done/Idle) |
+| `c` | Collapse / expand the group under the cursor |
+| `Space` | Toggle favorite on the selected agent |
+| `f` | Filter to favorites only |
+| `g` | Toggle 2×2 grid view |
+| `a` | Toggle the last-activity line under each agent |
 | `r` | Refresh agent list |
 | `q` | Quit |
+
+Collapsed groups and favorites persist across restarts (`~/.config/agent-monitor/collapsed.json`, `favorites.json`). Group-by-status regroups the same agents by their live state — handy for answering "what's waiting on me right now?" across every project at once.
 
 ### Key bindings in outer tmux
 

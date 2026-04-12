@@ -259,6 +259,56 @@ func saveFavorites(favs map[string]bool) {
 	os.WriteFile(path, data, 0644)
 }
 
+// collapsedPath returns the path to the collapsed-groups file.
+func collapsedPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "agent-monitor", "collapsed.json")
+}
+
+// loadCollapsed reads collapsed group names from disk.
+func loadCollapsed() map[string]bool {
+	path := collapsedPath()
+	if path == "" {
+		return make(map[string]bool)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return make(map[string]bool)
+	}
+	var names []string
+	if err := json.Unmarshal(data, &names); err != nil {
+		return make(map[string]bool)
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// saveCollapsed writes collapsed group names to disk.
+func saveCollapsed(collapsed map[string]bool) {
+	path := collapsedPath()
+	if path == "" {
+		return
+	}
+	var names []string
+	for n, v := range collapsed {
+		if v {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	data, err := json.Marshal(names)
+	if err != nil {
+		return
+	}
+	os.WriteFile(path, data, 0644)
+}
+
 // Spinner frames for running agents
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -1923,6 +1973,8 @@ type Model struct {
 	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
 	favorites           map[string]bool        // session name -> is favorite
 	filterFavorites     bool                   // when true, only show favorited agents
+	collapsed           map[string]bool        // group name -> collapsed (header shown, items hidden)
+	groupByStatus       bool                   // when true, bucket agents by status instead of config groups
 	scrollOffset        int                    // viewport scroll offset for agent list
 	gridMode            bool                   // grid mode active (2x2 pane layout)
 	gridSlot            int                    // active grid slot (0-3)
@@ -2036,6 +2088,7 @@ func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore
 		pendingTransition:   make(map[string]AgentStatus),
 		planPendingApproval: make(map[string]bool),
 		favorites:           loadFavorites(),
+		collapsed:           loadCollapsed(),
 		sharedState:         sharedState,
 		sseHub:              sseHub,
 		taskStore:           taskStore,
@@ -2112,6 +2165,12 @@ func (m *Model) buildGroups() {
 		agents = filtered
 	}
 
+	// Group-by-status mode: bucket live agents by their status, ignoring config.
+	if m.groupByStatus {
+		m.buildStatusGroups(agents)
+		return
+	}
+
 	if len(m.config.Groups) == 0 {
 		// No config — flat list with sub-groups but no group headers
 		if len(agents) == 0 {
@@ -2180,14 +2239,131 @@ func (m *Model) buildGroups() {
 		items := computeItems(buckets[i])
 		g := Group{Name: gc.Name, Items: items}
 		m.groups = append(m.groups, g)
-		m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		if !m.isCollapsed(g.Name) {
+			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		}
 	}
 	if len(other) > 0 && m.filterGroups == nil {
 		items := computeItems(other)
 		g := Group{Name: "Other", Items: items}
 		m.groups = append(m.groups, g)
-		m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		if !m.isCollapsed(g.Name) {
+			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		}
 	}
+}
+
+// statusBucket describes one status category for group-by-status mode.
+type statusBucket struct {
+	name  string
+	match func(m *Model, a Agent) bool
+}
+
+// statusBuckets defines the display order of status groups: agents that need
+// attention (waiting, error) sort above active ones, with idle at the bottom.
+var statusBuckets = []statusBucket{
+	{"Waiting", func(m *Model, a Agent) bool { return a.Status == StatusWaiting }},
+	{"Error", func(m *Model, a Agent) bool { return a.Status == StatusError }},
+	{"Running", func(m *Model, a Agent) bool { return a.Status == StatusRunning }},
+	{"Planning", func(m *Model, a Agent) bool { return a.Status == StatusPlanning }},
+	{"Done", func(m *Model, a Agent) bool { return a.Status == StatusIdle && m.isRecentlyIdle(a) }},
+	{"Idle", func(m *Model, a Agent) bool { return a.Status == StatusIdle && !m.isRecentlyIdle(a) }},
+}
+
+// buildStatusGroups buckets live agents by status. Only active agents are
+// included — phantom (non-running) sessions have no meaningful live status.
+func (m *Model) buildStatusGroups(agents []Agent) {
+	m.groups = nil
+	m.flatAgents = nil
+	for _, b := range statusBuckets {
+		var bagents []Agent
+		for _, a := range agents {
+			if a.Presence == PresenceActive && b.match(m, a) {
+				bagents = append(bagents, a)
+			}
+		}
+		if len(bagents) == 0 {
+			continue
+		}
+		items := computeItems(bagents)
+		m.groups = append(m.groups, Group{Name: b.name, Items: items})
+		if !m.isCollapsed(b.name) {
+			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		}
+	}
+	// Trailing "Offline" bucket for configured-but-not-running sessions, so
+	// switching to the status lens never blanks the screen when nothing is
+	// live. Collapse it to fold the noise away.
+	var offline []Agent
+	for _, a := range agents {
+		if a.Presence != PresenceActive {
+			offline = append(offline, a)
+		}
+	}
+	if len(offline) > 0 {
+		items := computeItems(offline)
+		m.groups = append(m.groups, Group{Name: "Offline", Items: items})
+		if !m.isCollapsed("Offline") {
+			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		}
+	}
+}
+
+// isCollapsed reports whether a group's items are hidden. The flat group
+// (empty name, no header) can never be collapsed.
+func (m Model) isCollapsed(name string) bool {
+	if name == "" {
+		return false
+	}
+	return m.collapsed[name]
+}
+
+// cursorGroupName returns the name of the group the cursor currently sits in,
+// walking flat ranges by index so it is robust to duplicate session names.
+func (m Model) cursorGroupName() string {
+	idx := 0
+	for _, g := range m.groups {
+		n := 0
+		if !m.isCollapsed(g.Name) {
+			n = len(flattenItems(g.Items))
+		}
+		if m.cursor >= idx && m.cursor < idx+n {
+			return g.Name
+		}
+		idx += n
+	}
+	return ""
+}
+
+// groupFlatRange returns the starting flatAgents index and visible agent count
+// of a group by name. start is where the group's agents begin (or would begin,
+// for a collapsed group). Returns (-1, 0) if the group is not found.
+func (m Model) groupFlatRange(name string) (start, count int) {
+	idx := 0
+	for _, g := range m.groups {
+		n := 0
+		if !m.isCollapsed(g.Name) {
+			n = len(flattenItems(g.Items))
+		}
+		if g.Name == name {
+			return idx, n
+		}
+		idx += n
+	}
+	return -1, 0
+}
+
+// displayAgents returns every grouped agent in display order, independent of
+// collapse state. m.flatAgents excludes agents in collapsed groups (so the
+// cursor and mouse can't land on hidden rows); the HTTP API, SSE diff, and
+// task auto-linking must instead see the full set regardless of what the TUI
+// happens to have folded away.
+func (m Model) displayAgents() []Agent {
+	var out []Agent
+	for _, g := range m.groups {
+		out = append(out, flattenItems(g.Items)...)
+	}
+	return out
 }
 
 // spinnerTickCmd sends a tick every 100ms for spinner animation.
@@ -2966,6 +3142,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.enterGridMode()
 			}
 
+		case key.Matches(msg, keys.ToggleCollapse):
+			name := m.cursorGroupName()
+			if name != "" {
+				if m.collapsed == nil {
+					m.collapsed = make(map[string]bool)
+				}
+				expanding := m.collapsed[name]
+				if expanding {
+					delete(m.collapsed, name) // absent = expanded (keeps the map small)
+				} else {
+					m.collapsed[name] = true
+				}
+				saveCollapsed(m.collapsed)
+				m.scrollOffset = 0
+				m.buildGroups()
+				// Reposition the cursor: on expand, land on the group's first
+				// agent; on collapse, land on whatever now occupies its slot.
+				if start, _ := m.groupFlatRange(name); start >= 0 {
+					m.cursor = start
+				}
+				if m.cursor >= len(m.flatAgents) {
+					m.cursor = len(m.flatAgents) - 1
+				}
+				if m.cursor < 0 {
+					m.cursor = 0
+				}
+				m.snapCursorToSelectable()
+				m.ensureCursorVisible()
+			}
+
+		case key.Matches(msg, keys.GroupByStatus):
+			m.groupByStatus = !m.groupByStatus
+			m.scrollOffset = 0
+			m.buildGroups()
+			if m.cursor >= len(m.flatAgents) {
+				m.cursor = len(m.flatAgents) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			m.snapCursorToSelectable()
+			m.ensureCursorVisible()
+
 		default:
 			// Grid slot selection: 1-4
 			if m.gridMode {
@@ -3161,16 +3380,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 		}
 		m.buildGroups()
-		if m.sharedState != nil {
-			prev := m.sharedState.Update(m.flatAgents, m.groups)
-			if m.sseHub != nil {
-				for _, event := range diffAgents(prev, m.flatAgents) {
-					m.sseHub.Broadcast(event)
+		if m.sharedState != nil || m.taskStore != nil {
+			disp := m.displayAgents()
+			if m.sharedState != nil {
+				prev := m.sharedState.Update(disp, m.groups)
+				if m.sseHub != nil {
+					for _, event := range diffAgents(prev, disp) {
+						m.sseHub.Broadcast(event)
+					}
 				}
 			}
-		}
-		if m.taskStore != nil {
-			m.taskStore.AutoLink(m.flatAgents, m.sseHub)
+			if m.taskStore != nil {
+				m.taskStore.AutoLink(disp, m.sseHub)
+			}
 		}
 		if m.cursor >= len(m.flatAgents) && len(m.flatAgents) > 0 {
 			m.cursor = len(m.flatAgents) - 1
@@ -3255,6 +3477,9 @@ func (m *Model) ensureCursorVisible() {
 	for _, g := range m.groups {
 		if g.Name != "" {
 			line++ // group header
+		}
+		if m.isCollapsed(g.Name) {
+			continue // items hidden — cursor can't be inside a collapsed group
 		}
 		for _, item := range g.Items {
 			if item.IsSubGroup {
@@ -3345,6 +3570,9 @@ func (m Model) mouseYToAgentIndex(y int) int {
 				return -1 // clicked on group header
 			}
 			line++
+		}
+		if m.isCollapsed(g.Name) {
+			continue // items hidden — nothing selectable in this group
 		}
 
 		for _, item := range g.Items {
@@ -3767,25 +3995,29 @@ func (m Model) renderGradientTitle(text string) string {
 // Format: ●2 ◇1 ◐1 ✓3 ○5  (only non-zero counts shown)
 func (m Model) renderStatusSummary() string {
 	var running, planning, waiting, idle, recentIdle, errCount int
-	for _, a := range m.flatAgents {
-		if a.Presence != PresenceActive {
-			continue
-		}
-		switch a.Status {
-		case StatusRunning:
-			running++
-		case StatusPlanning:
-			planning++
-		case StatusWaiting:
-			waiting++
-		case StatusIdle:
-			if m.isRecentlyIdle(a) {
-				recentIdle++
-			} else {
-				idle++
+	// Count across all groups (not m.flatAgents) so collapsed groups still
+	// contribute to the global summary line.
+	for _, g := range m.groups {
+		for _, a := range flattenItems(g.Items) {
+			if a.Presence != PresenceActive {
+				continue
 			}
-		case StatusError:
-			errCount++
+			switch a.Status {
+			case StatusRunning:
+				running++
+			case StatusPlanning:
+				planning++
+			case StatusWaiting:
+				waiting++
+			case StatusIdle:
+				if m.isRecentlyIdle(a) {
+					recentIdle++
+				} else {
+					idle++
+				}
+			case StatusError:
+				errCount++
+			}
 		}
 	}
 
@@ -3815,6 +4047,34 @@ func (m Model) renderStatusSummary() string {
 	return strings.Join(parts, " ")
 }
 
+// groupHeaderColor picks the header color for a group. In group-by-status mode
+// headers take their status color; otherwise they cycle through the purple
+// palette, with "Other" dimmed.
+func (m Model) groupHeaderColor(name string, gi int) lipgloss.Color {
+	if m.groupByStatus {
+		switch name {
+		case "Waiting":
+			return lipgloss.Color("220")
+		case "Error":
+			return lipgloss.Color("196")
+		case "Running":
+			return lipgloss.Color("82")
+		case "Planning":
+			return lipgloss.Color("141")
+		case "Done":
+			return lipgloss.Color("78")
+		case "Idle":
+			return lipgloss.Color("245")
+		case "Offline":
+			return otherGroupColor
+		}
+	}
+	if name == "Other" {
+		return otherGroupColor
+	}
+	return groupHeaderColors[gi%len(groupHeaderColors)]
+}
+
 func (m Model) View() string {
 	if m.quitting {
 		return ""
@@ -3840,26 +4100,32 @@ func (m Model) View() string {
 	header.WriteString(m.renderGradientTitle(title))
 	header.WriteString("\n\n")
 
-	// Build agent list lines
+	// Build agent list lines. Key the empty message off groups, not flatAgents:
+	// when every group is collapsed, flatAgents is empty but the headers must
+	// still render.
 	var listLines []string
-	if len(m.flatAgents) == 0 {
+	if len(m.groups) == 0 {
 		listLines = append(listLines, normalStyle.Render("No agents found."))
 		listLines = append(listLines, dimStyle.Render("Start an agent in tmux."))
 	} else {
 		agentIdx := 0
 		for gi, g := range m.groups {
+			collapsed := m.isCollapsed(g.Name)
 			// Group header (skip for empty name — flat mode)
 			if g.Name != "" {
-				var headerColor lipgloss.Color
-				if g.Name == "Other" {
-					headerColor = otherGroupColor
-				} else {
-					headerColor = groupHeaderColors[gi%len(groupHeaderColors)]
-				}
 				hdrStyle := lipgloss.NewStyle().
 					Bold(true).
-					Foreground(headerColor)
-				listLines = append(listLines, hdrStyle.Render(fmt.Sprintf("┌ %s", g.Name)))
+					Foreground(m.groupHeaderColor(g.Name, gi))
+				chevron := "▾"
+				label := g.Name
+				if collapsed {
+					chevron = "▸"
+					label = fmt.Sprintf("%s (%d)", g.Name, len(flattenItems(g.Items)))
+				}
+				listLines = append(listLines, hdrStyle.Render(fmt.Sprintf("%s %s", chevron, label)))
+			}
+			if collapsed {
+				continue // items hidden
 			}
 
 			for _, item := range g.Items {
@@ -3887,7 +4153,7 @@ func (m Model) View() string {
 
 	// Status summary
 	var footer strings.Builder
-	if len(m.flatAgents) > 0 {
+	if len(m.groups) > 0 {
 		summary := m.renderStatusSummary()
 		if summary != "" {
 			footer.WriteString(dimStyle.Render("─") + " " + summary + "\n")
@@ -3939,7 +4205,7 @@ func (m Model) View() string {
 	if m.gridMode {
 		helpKeys = fmt.Sprintf("j/k:nav  ⏎:assign[%d]  1-4:slot  l:focus  g:single  C-\\h:back  q:quit", m.gridSlot+1)
 	} else {
-		helpKeys = "j/k:nav  ⏎:attach  l:focus  C-\\h:back  ␣:fav  f:filter  g:grid  a:activity  q:quit"
+		helpKeys = "j/k:nav  ⏎:attach  l:focus  s:status  c:fold  ␣:fav  f:filter  g:grid  a:activity  q:quit"
 	}
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
@@ -3958,6 +4224,8 @@ type keyMap struct {
 	ToggleFavorite  key.Binding
 	FilterFavorites key.Binding
 	ToggleGrid      key.Binding
+	ToggleCollapse  key.Binding
+	GroupByStatus   key.Binding
 	Quit            key.Binding
 }
 
@@ -3988,6 +4256,12 @@ var keys = keyMap{
 	),
 	ToggleGrid: key.NewBinding(
 		key.WithKeys("g"),
+	),
+	ToggleCollapse: key.NewBinding(
+		key.WithKeys("c"),
+	),
+	GroupByStatus: key.NewBinding(
+		key.WithKeys("s"),
 	),
 	Quit: key.NewBinding(
 		key.WithKeys("q", "ctrl+c"),
@@ -4145,16 +4419,19 @@ curl -sX POST http://localhost:%d/api/webhook \
 				m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 			}
 			m.buildGroups()
-			if sharedState != nil {
-				prev := sharedState.Update(m.flatAgents, m.groups)
-				if sseHub != nil {
-					for _, event := range diffAgents(prev, m.flatAgents) {
-						sseHub.Broadcast(event)
+			if sharedState != nil || taskStore != nil {
+				disp := m.displayAgents()
+				if sharedState != nil {
+					prev := sharedState.Update(disp, m.groups)
+					if sseHub != nil {
+						for _, event := range diffAgents(prev, disp) {
+							sseHub.Broadcast(event)
+						}
 					}
 				}
-			}
-			if taskStore != nil {
-				taskStore.AutoLink(m.flatAgents, sseHub)
+				if taskStore != nil {
+					taskStore.AutoLink(disp, sseHub)
+				}
 			}
 			time.Sleep(2 * time.Second)
 		}
