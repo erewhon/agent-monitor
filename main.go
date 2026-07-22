@@ -3172,6 +3172,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.ensureCursorVisible()
 			}
 
+		case key.Matches(msg, keys.CollapseAll):
+			// Bulk fold/unfold: if anything is currently folded, expand
+			// everything; otherwise collapse every named group. This is the
+			// keyboard escape hatch — a folded group's header has no cursor
+			// slot, so per-group `c` can't re-target it once hidden.
+			anyCollapsed := len(m.collapsed) > 0
+			if anyCollapsed {
+				m.collapsed = make(map[string]bool)
+			} else {
+				m.collapsed = make(map[string]bool)
+				for _, g := range m.groups {
+					if g.Name != "" {
+						m.collapsed[g.Name] = true
+					}
+				}
+			}
+			saveCollapsed(m.collapsed)
+			m.scrollOffset = 0
+			m.buildGroups()
+			if m.cursor >= len(m.flatAgents) {
+				m.cursor = len(m.flatAgents) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			m.snapCursorToSelectable()
+			m.ensureCursorVisible()
+
 		case key.Matches(msg, keys.GroupByStatus):
 			m.groupByStatus = !m.groupByStatus
 			m.scrollOffset = 0
@@ -3203,6 +3231,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			// A click on a group header toggles that group's fold state. This is
+			// the selective unfold path: once a group is folded its header has no
+			// cursor slot, so `c` can't re-target it — but the header is still
+			// clickable.
+			if gi := m.mouseYToGroupIndex(msg.Y); gi >= 0 {
+				name := m.groups[gi].Name
+				if name != "" {
+					if m.collapsed == nil {
+						m.collapsed = make(map[string]bool)
+					}
+					if m.collapsed[name] {
+						delete(m.collapsed, name)
+					} else {
+						m.collapsed[name] = true
+					}
+					saveCollapsed(m.collapsed)
+					m.scrollOffset = 0
+					m.buildGroups()
+					if start, _ := m.groupFlatRange(name); start >= 0 {
+						m.cursor = start
+					}
+					if m.cursor >= len(m.flatAgents) {
+						m.cursor = len(m.flatAgents) - 1
+					}
+					if m.cursor < 0 {
+						m.cursor = 0
+					}
+					m.snapCursorToSelectable()
+					m.ensureCursorVisible()
+				}
+				break
+			}
 			idx := m.mouseYToAgentIndex(msg.Y)
 			if idx >= 0 && idx < len(m.flatAgents) && m.flatAgents[idx].Presence != PresenceNoSession {
 				m.cursor = idx
@@ -3597,6 +3657,41 @@ func (m Model) mouseYToAgentIndex(y int) int {
 				}
 				line += h
 				agentIdx++
+			}
+		}
+	}
+	return -1
+}
+
+// mouseYToGroupIndex converts a mouse Y coordinate to the index of the group
+// whose header line sits at that row (collapsed or expanded), or -1 if the row
+// is not a group header. It replays the same layout walk as mouseYToAgentIndex
+// so header hits line up exactly with agent hits. Clicking a header toggles its
+// collapse state, giving per-group unfold that the keyboard can't (a folded
+// group's header has no cursor slot).
+func (m Model) mouseYToGroupIndex(y int) int {
+	line := 1 // top border
+	line++    // title
+	line++    // blank line
+
+	for gi, g := range m.groups {
+		if g.Name != "" {
+			if y == line {
+				return gi
+			}
+			line++
+		}
+		if m.isCollapsed(g.Name) {
+			continue // items hidden
+		}
+		for _, item := range g.Items {
+			if item.IsSubGroup {
+				line++ // sub-group header
+				for _, agent := range item.SubGroup.Agents {
+					line += m.agentLineHeight(agent)
+				}
+			} else {
+				line += m.agentLineHeight(item.Agent)
 			}
 		}
 	}
@@ -4205,7 +4300,7 @@ func (m Model) View() string {
 	if m.gridMode {
 		helpKeys = fmt.Sprintf("j/k:nav  ⏎:assign[%d]  1-4:slot  l:focus  g:single  C-\\h:back  q:quit", m.gridSlot+1)
 	} else {
-		helpKeys = "j/k:nav  ⏎:attach  l:focus  s:status  c:fold  ␣:fav  f:filter  g:grid  a:activity  q:quit"
+		helpKeys = "j/k:nav  ⏎:attach  l:focus  s:status  c:fold  C:fold all  ␣:fav  f:filter  g:grid  a:activity  q:quit"
 	}
 	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
@@ -4225,6 +4320,7 @@ type keyMap struct {
 	FilterFavorites key.Binding
 	ToggleGrid      key.Binding
 	ToggleCollapse  key.Binding
+	CollapseAll     key.Binding
 	GroupByStatus   key.Binding
 	Quit            key.Binding
 }
@@ -4259,6 +4355,9 @@ var keys = keyMap{
 	),
 	ToggleCollapse: key.NewBinding(
 		key.WithKeys("c"),
+	),
+	CollapseAll: key.NewBinding(
+		key.WithKeys("C"),
 	),
 	GroupByStatus: key.NewBinding(
 		key.WithKeys("s"),
