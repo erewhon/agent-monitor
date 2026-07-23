@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/base64"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,21 +32,21 @@ import (
 var version = "dev"
 
 var (
-	listOnly          = flag.Bool("list", false, "List agents and exit (no TUI)")
-	outerSocket       = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
-	noAttach          = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
-	groupsFlag        = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
-	autoApprovePlans  = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
-	notifyOSC         = flag.Bool("notify", true, "Enable OSC 777 terminal notifications (passthrough to terminal emulator)")
-	ntfyTopic         = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
-	ntfyServer        = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
-	notifyCmd         = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
-	webPort           = flag.Int("web-port", 8070, "HTTP API port")
-	noWeb             = flag.Bool("no-web", false, "Disable embedded HTTP server")
-	webOnly           = flag.Bool("web-only", false, "Run HTTP server only, no TUI")
-	webhookKey        = flag.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
-	forwardURL        = flag.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
-	forwardKey        = flag.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
+	listOnly         = flag.Bool("list", false, "List agents and exit (no TUI)")
+	outerSocket      = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
+	noAttach         = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
+	groupsFlag       = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
+	autoApprovePlans = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
+	notifyOSC        = flag.Bool("notify", true, "Enable OSC 777 terminal notifications (passthrough to terminal emulator)")
+	ntfyTopic        = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
+	ntfyServer       = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
+	notifyCmd        = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
+	webPort          = flag.Int("web-port", 8070, "HTTP API port")
+	noWeb            = flag.Bool("no-web", false, "Disable embedded HTTP server")
+	webOnly          = flag.Bool("web-only", false, "Run HTTP server only, no TUI")
+	webhookKey       = flag.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
+	forwardURL       = flag.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
+	forwardKey       = flag.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
 )
 
 // Agent type identifies which coding agent tool is running
@@ -710,9 +710,15 @@ type Task struct {
 	Column      TaskColumn `json:"column"`
 	SessionName string     `json:"session_name,omitempty"`
 	Group       string     `json:"group,omitempty"`
-	NousPageID  string     `json:"nous_page_id,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	// Source identifies the backend this card came from (e.g. "nous", "gh",
+	// "bug"); it is also the card's source badge. SourceID is the stable id
+	// within that backend (Nous page id, "owner/repo#123", "repo:bug-id").
+	Source     string    `json:"source,omitempty"`
+	SourceID   string    `json:"source_id,omitempty"`
+	URL        string    `json:"url,omitempty"` // link out to the issue/page, if any
+	NousPageID string    `json:"nous_page_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type taskPatchRequest struct {
@@ -721,6 +727,9 @@ type taskPatchRequest struct {
 	Column      *TaskColumn `json:"column,omitempty"`
 	SessionName *string     `json:"session_name,omitempty"`
 	Group       *string     `json:"group,omitempty"`
+	Source      *string     `json:"source,omitempty"`
+	SourceID    *string     `json:"source_id,omitempty"`
+	URL         *string     `json:"url,omitempty"`
 	NousPageID  *string     `json:"nous_page_id,omitempty"`
 }
 
@@ -751,6 +760,19 @@ func newTaskStore() *TaskStore {
 		if data, err := os.ReadFile(path); err == nil {
 			json.Unmarshal(data, &ts.data)
 		}
+	}
+	// Migrate legacy single-backend cards to the generic source identity.
+	migrated := false
+	for i := range ts.data.Tasks {
+		t := &ts.data.Tasks[i]
+		if t.NousPageID != "" && t.Source == "" {
+			t.Source = "nous"
+			t.SourceID = t.NousPageID
+			migrated = true
+		}
+	}
+	if migrated {
+		ts.saveLocked()
 	}
 	return ts
 }
@@ -790,6 +812,18 @@ func (ts *TaskStore) Get(id int) (Task, bool) {
 	return Task{}, false
 }
 
+// GetBySource returns the task originating from a given backend source, if any.
+func (ts *TaskStore) GetBySource(source, sourceID string) (Task, bool) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for _, t := range ts.data.Tasks {
+		if t.Source == source && t.SourceID == sourceID {
+			return t, true
+		}
+	}
+	return Task{}, false
+}
+
 func (ts *TaskStore) Create(title, description, sessionName, group string) Task {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -802,6 +836,29 @@ func (ts *TaskStore) Create(title, description, sessionName, group string) Task 
 		Group:       group,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
+	}
+	ts.data.NextID++
+	ts.data.Tasks = append(ts.data.Tasks, task)
+	ts.saveLocked()
+	return task
+}
+
+// CreateSourced creates a card originating from a backend source, carrying its
+// source identity, group, link, and initial column.
+func (ts *TaskStore) CreateSourced(source, sourceID, title, group, url string, col TaskColumn) Task {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	now := time.Now()
+	task := Task{
+		ID:        ts.data.NextID,
+		Title:     title,
+		Column:    col,
+		Group:     group,
+		Source:    source,
+		SourceID:  sourceID,
+		URL:       url,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	ts.data.NextID++
 	ts.data.Tasks = append(ts.data.Tasks, task)
@@ -831,6 +888,15 @@ func (ts *TaskStore) Update(id int, patch taskPatchRequest) (Task, bool) {
 		}
 		if patch.Group != nil {
 			t.Group = *patch.Group
+		}
+		if patch.Source != nil {
+			t.Source = *patch.Source
+		}
+		if patch.SourceID != nil {
+			t.SourceID = *patch.SourceID
+		}
+		if patch.URL != nil {
+			t.URL = *patch.URL
 		}
 		if patch.NousPageID != nil {
 			t.NousPageID = *patch.NousPageID
@@ -1040,6 +1106,7 @@ type NousConfig struct {
 	Notebook     string `yaml:"notebook"`
 	Tag          string `yaml:"tag"`
 	PollInterval int    `yaml:"poll_interval"`
+	APIKey       string `yaml:"api_key"`
 }
 
 func loadNousConfig() *NousConfig {
@@ -1065,6 +1132,9 @@ func loadNousConfig() *NousConfig {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 30
 	}
+	if cfg.APIKey == "" {
+		cfg.APIKey = os.Getenv("NOUS_API_KEY")
+	}
 	return &cfg
 }
 
@@ -1074,7 +1144,29 @@ type NousClient struct {
 	notebookID string
 	notebook   string
 	tag        string
+	apiKey     string
 	client     *http.Client
+}
+
+// newReq builds a request carrying the Nous bearer token when configured.
+func (c *NousClient) newReq(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	return req, nil
+}
+
+// get issues an authenticated GET.
+func (c *NousClient) get(url string) (*http.Response, error) {
+	req, err := c.newReq("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.client.Do(req)
 }
 
 type nousEnvelope struct {
@@ -1099,6 +1191,7 @@ func newNousClient(cfg *NousConfig) *NousClient {
 		baseURL:  cfg.URL,
 		notebook: cfg.Notebook,
 		tag:      cfg.Tag,
+		apiKey:   cfg.APIKey,
 		client:   &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -1107,7 +1200,7 @@ func (c *NousClient) resolveNotebookID() error {
 	if c.notebookID != "" {
 		return nil
 	}
-	resp, err := c.client.Get(c.baseURL + "/api/notebooks")
+	resp, err := c.get(c.baseURL + "/api/notebooks")
 	if err != nil {
 		return err
 	}
@@ -1131,7 +1224,7 @@ func (c *NousClient) listPages() ([]nousPage, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/pages")
+	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/pages")
 	if err != nil {
 		return nil, err
 	}
@@ -1150,7 +1243,7 @@ func (c *NousClient) updateTags(pageID string, tags []string) error {
 		return err
 	}
 	body, _ := json.Marshal(map[string][]string{"tags": tags})
-	req, _ := http.NewRequest("PUT",
+	req, _ := c.newReq("PUT",
 		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/tags",
 		bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -1174,10 +1267,10 @@ type nousDatabase struct {
 }
 
 type nousProperty struct {
-	ID      string           `json:"id"`
-	Name    string           `json:"name"`
-	Type    string           `json:"type"`
-	Options []nousOption     `json:"options,omitempty"`
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	Type    string       `json:"type"`
+	Options []nousOption `json:"options,omitempty"`
 }
 
 type nousOption struct {
@@ -1203,7 +1296,7 @@ func (c *NousClient) listDatabases() ([]struct{ ID, Title string }, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases")
+	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases")
 	if err != nil {
 		return nil, err
 	}
@@ -1221,7 +1314,7 @@ func (c *NousClient) getDatabase(dbID string) (*nousDatabase, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases/" + dbID)
+	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases/" + dbID)
 	if err != nil {
 		return nil, err
 	}
@@ -1327,7 +1420,7 @@ func (c *NousClient) appendToPage(pageID, content string) error {
 		return err
 	}
 	body, _ := json.Marshal(map[string]string{"content": content})
-	req, _ := http.NewRequest("POST",
+	req, _ := c.newReq("POST",
 		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/append",
 		bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -1451,158 +1544,6 @@ func launchSession(project ProjectConfig, taskPrompt string) error {
 // shellQuote wraps a string in single quotes, escaping existing single quotes.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
-}
-
-// startNousSyncLoop runs bidirectional sync between the Kanban board and Nous notebooks.
-func startNousSyncLoop(cfg *NousConfig, tasks *TaskStore, hub *SSEHub) {
-	nous := newNousClient(cfg)
-	interval := time.Duration(cfg.PollInterval) * time.Second
-
-	// Build initial state
-	knownPages := make(map[string]bool)
-	for _, t := range tasks.List(true) {
-		if t.NousPageID != "" {
-			knownPages[t.NousPageID] = true
-		}
-	}
-	prevColumns := make(map[int]TaskColumn)
-	for _, t := range tasks.List(false) {
-		prevColumns[t.ID] = t.Column
-	}
-
-	for {
-		// --- Nous → Board ---
-		pages, err := nous.listPages()
-		if err == nil {
-			for _, page := range pages {
-				if !hasTag(page, cfg.Tag) {
-					continue
-				}
-				if knownPages[page.ID] {
-					for _, t := range tasks.List(false) {
-						newGroup := inferProjectFromTags(page.Tags)
-						if t.NousPageID == page.ID && (t.Title != page.Title || t.Group != newGroup) {
-							title := page.Title
-							tasks.Update(t.ID, taskPatchRequest{Title: &title, Group: &newGroup})
-							if hub != nil {
-								updated, _ := tasks.Get(t.ID)
-								data, _ := json.Marshal(updated)
-								hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
-							}
-						}
-					}
-					continue
-				}
-				group := inferProjectFromTags(page.Tags)
-				task := tasks.Create(page.Title, "", "", group)
-				nousID := page.ID
-				tasks.Update(task.ID, taskPatchRequest{NousPageID: &nousID})
-				knownPages[page.ID] = true
-				if hub != nil {
-					updated, _ := tasks.Get(task.ID)
-					data, _ := json.Marshal(updated)
-					hub.Broadcast(SSEEvent{Type: "task:created", Data: data})
-				}
-			}
-
-			// --- Nous Database → Board (status + project sync) ---
-			dbRows, dbErr := nous.getTaskRows()
-			if dbErr == nil {
-				// Build lookup: normalized task name → database row
-				// Strip "Task: " prefix for matching
-				rowByName := make(map[string]nousTaskRow)
-				for _, row := range dbRows {
-					rowByName[row.Task] = row
-				}
-
-				for _, t := range tasks.List(true) {
-					// Normalize task title for matching: strip "Task: " prefix
-					name := strings.TrimPrefix(t.Title, "Task: ")
-					row, found := rowByName[name]
-					if !found {
-						// Try exact title match
-						row, found = rowByName[t.Title]
-					}
-					if !found {
-						continue
-					}
-
-					newGroup := row.Project
-					newCol := nousStatusToColumn(row.Status)
-					needsUpdate := false
-					patch := taskPatchRequest{}
-
-					if newGroup != "" && newGroup != t.Group {
-						patch.Group = &newGroup
-						needsUpdate = true
-					}
-					if newCol != t.Column {
-						patch.Column = &newCol
-						needsUpdate = true
-					}
-
-					if needsUpdate {
-						tasks.Update(t.ID, patch)
-						if hub != nil {
-							updated, _ := tasks.Get(t.ID)
-							data, _ := json.Marshal(updated)
-							hub.Broadcast(SSEEvent{Type: "task:updated", Data: data})
-						}
-					}
-				}
-			}
-
-			// --- Board → Nous ---
-			currentTasks := tasks.List(false)
-			for _, t := range currentTasks {
-				if t.NousPageID == "" {
-					continue
-				}
-				prev, known := prevColumns[t.ID]
-				if !known {
-					prevColumns[t.ID] = t.Column
-					continue
-				}
-				if t.Column == prev {
-					continue
-				}
-				prevColumns[t.ID] = t.Column
-
-				var page *nousPage
-				for _, p := range pages {
-					if p.ID == t.NousPageID {
-						page = &p
-						break
-					}
-				}
-				if page == nil {
-					continue
-				}
-
-				newTags := make([]string, 0, len(page.Tags)+2)
-				for _, tag := range page.Tags {
-					if tag != "active" && tag != "done" && tag != "needs-input" {
-						newTags = append(newTags, tag)
-					}
-				}
-				switch t.Column {
-				case ColumnActive:
-					newTags = append(newTags, "active")
-				case ColumnNeedsInput:
-					newTags = append(newTags, "needs-input")
-				case ColumnDone:
-					newTags = append(newTags, "done")
-				}
-				nous.updateTags(t.NousPageID, newTags)
-
-				logEntry := fmt.Sprintf("\n---\n*%s — moved to %s*\n",
-					time.Now().Format("2006-01-02 15:04"), t.Column)
-				nous.appendToPage(t.NousPageID, logEntry)
-			}
-		}
-
-		time.Sleep(interval)
-	}
 }
 
 // startForwarder periodically sends local agent state changes to a remote agent-monitor.
@@ -1952,21 +1893,21 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 
 // Model is the Bubble Tea model
 type Model struct {
-	agents       []Agent
-	cursor       int
-	width        int
-	height       int
-	outerSocket  string // Socket for outer tmux (to control right pane)
-	attached     string // Currently attached agent target
-	err          error
-	quitting     bool
-	config       Config   // Loaded group config
-	groups       []Group  // Computed groups for display
-	flatAgents   []Agent  // Flattened agent list in display order (cursor indexes into this)
-	spinnerFrame  int      // Animation frame counter
-	spinnerActive bool     // Whether a spinner tick chain is running
-	showActivity   bool     // Toggle: show last activity line under each agent
-	lastActiveAt   map[string]time.Time // session -> when last seen in an active state
+	agents              []Agent
+	cursor              int
+	width               int
+	height              int
+	outerSocket         string // Socket for outer tmux (to control right pane)
+	attached            string // Currently attached agent target
+	err                 error
+	quitting            bool
+	config              Config                 // Loaded group config
+	groups              []Group                // Computed groups for display
+	flatAgents          []Agent                // Flattened agent list in display order (cursor indexes into this)
+	spinnerFrame        int                    // Animation frame counter
+	spinnerActive       bool                   // Whether a spinner tick chain is running
+	showActivity        bool                   // Toggle: show last activity line under each agent
+	lastActiveAt        map[string]time.Time   // session -> when last seen in an active state
 	filterGroups        map[string]bool        // If non-nil, only show these group names
 	previousStatus      map[string]AgentStatus // session -> last known status (for transition detection)
 	pendingTransition   map[string]AgentStatus // session -> status seen once but not yet confirmed (debounce)
@@ -2575,10 +2516,10 @@ func looksLikeClaude(target string) bool {
 	// Active-state markers: tool output, spinners, permission prompts
 	// These are visible when Claude is running and the idle prompt has scrolled off.
 	activePatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?m)…\s+\(\d+[ms]`),          // spinner with timing: "… (5s"
-		regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+`),   // spinner prefix chars
-		regexp.MustCompile(`(?m)^⎿`),                      // tool result marker
-		regexp.MustCompile(`(?m)^●\s+Running\s+\d+`),      // subagent execution
+		regexp.MustCompile(`(?m)…\s+\(\d+[ms]`),       // spinner with timing: "… (5s"
+		regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+`), // spinner prefix chars
+		regexp.MustCompile(`(?m)^⎿`),                  // tool result marker
+		regexp.MustCompile(`(?m)^●\s+Running\s+\d+`),  // subagent execution
 	}
 	for _, re := range activePatterns {
 		if re.MatchString(content) {
@@ -2866,7 +2807,7 @@ func findActivityLine(lines []string) string {
 		"⏵",
 		"────",
 		"❯",
-		"@",             // user@host prompt lines
+		"@", // user@host prompt lines
 		"Esc to cancel",
 		"Tab to amend",
 		"Do you want",
@@ -2989,6 +2930,7 @@ func detectCrushStatus(target string) (AgentStatus, string) {
 // Running state indicators:
 //   - Progress bar with ■/⬝ characters and "esc interrupt" in the bottom bar
 //   - Tool call lines prefixed with ✱ (e.g. "✱ Glob ...")
+//
 // Idle state: bottom bar shows "tab switch agent" / "tab agents"
 func detectOpenCodeStatus(target string) (AgentStatus, string) {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
@@ -4504,8 +4446,8 @@ curl -sX POST http://localhost:%d/api/webhook \
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
-		if nousCfg := loadNousConfig(); nousCfg != nil && taskStore != nil {
-			go startNousSyncLoop(nousCfg, taskStore, sseHub)
+		if sources := loadBackendsConfig(); len(sources) > 0 && taskStore != nil {
+			startBackendSyncLoop(sources, taskStore, sseHub)
 		}
 		m := initialModel(sharedState, sseHub, taskStore, webhookStore)
 		for {
@@ -4536,9 +4478,9 @@ curl -sX POST http://localhost:%d/api/webhook \
 		}
 	}
 
-	// Start Nous sync if configured
-	if nousCfg := loadNousConfig(); nousCfg != nil && taskStore != nil {
-		go startNousSyncLoop(nousCfg, taskStore, sseHub)
+	// Start backend sync (Nous + GitHub + git-bug) if configured
+	if sources := loadBackendsConfig(); len(sources) > 0 && taskStore != nil {
+		startBackendSyncLoop(sources, taskStore, sseHub)
 	}
 
 	// Start forwarder if configured
