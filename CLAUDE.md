@@ -24,7 +24,9 @@ agent-monitor --list
 
 ## Architecture
 
-Single-file Go TUI (`main.go`) using the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework (Elm architecture: Model/Update/View). No tests currently.
+Go TUI in `main.go` using the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework (Elm architecture: Model/Update/View). The Kanban task-backend layer lives in separate `package main` files: `backends.go` (the `TaskSource` interface, `backends.yaml` loader, generic sync loop, and Nous source) plus `backend_github.go` and `backend_gitbug.go`.
+
+**Task backends:** The web Kanban board reads/writes a local JSON `TaskStore` (`~/.config/agent-monitor/tasks.json`), which is fed by one goroutine per configured `TaskSource` (`startBackendSyncLoop`). Each `Task` carries `Source` (unique routing key + badge), `SourceID`, and `URL`. `backends.yaml` is project-centric: a project = one swim lane declaring one or more backends (`nous` / `github` / `git-bug`); a listed project's backends are authoritative for its lane, while unlisted Nous projects auto-appear when `import_all: true`. If `backends.yaml` is absent, the legacy `nous.yaml` is used as a single Nous backend. The reconcile loop is **push-first** (board→backend before the authoritative pull) so board moves aren't reverted mid-tick. The Nous server requires a bearer token (`api_key` / `NOUS_API_KEY`).
 
 **Core types:**
 - `Agent` — represents a coding agent instance (Claude Code, OpenCode, or Crush) detected in a tmux pane (session:window.pane targeting)

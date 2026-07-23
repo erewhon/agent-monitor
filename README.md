@@ -107,6 +107,54 @@ groups:
 - If the config file is missing or malformed, agents display in a flat alphabetical list
 - Groups cycle through purple/violet header colors; "Other" uses a dimmer blue-gray
 
+## Task Backends (Kanban board)
+
+The web Kanban board (`http://localhost:8070`) can pull tasks from multiple
+project-management backends at once — **Nous**, **GitHub Issues** (public or
+Enterprise), and **git-bug** (per-repo) — configured in
+`~/.config/agent-monitor/backends.yaml`.
+
+A **project** is a swim lane and declares one or more backends. Cards are badged
+by source (`nous` / `gh` / `bug`), link out to the issue/page, and moving a card
+between columns writes the change back to its tracker (close/reopen an issue,
+`git bug status`, Nous tags + log).
+
+```yaml
+nous:                          # optional global Nous connection
+  url: http://localhost:7667
+  notebook: Forge
+  tag: task
+  api_key: rw:…                # or set NOUS_API_KEY (Nous now requires a key)
+  import_all: true             # auto-show every Nous project not listed below
+
+projects:
+  - name: ProjectA             # → GitHub only
+    backends:
+      - github: { host: github.com, repo: erewhon/projectA }
+
+  - name: ProjectB             # → git-bug only
+    backends:
+      - git-bug: { repo: ~/Projects/projectB }
+
+  - name: AgentMonitor         # → one lane, two trackers merged
+    nous_project: "Agent Monitor"   # only if the Nous name differs from `name`
+    backends:
+      - nous: {}
+      - github: { repo: erewhon/agent-monitor }
+```
+
+- **Granularity:** a listed project's `backends` are authoritative for its lane,
+  so a repo fully moved to git-bug shows only git-bug, while a mid-migration repo
+  can merge Nous + GitHub. Unlisted Nous projects keep auto-appearing
+  (`import_all: true`).
+- **GitHub auth:** per backend, `token:` → `token_cmd:` (default `gh auth token`)
+  → `GITHUB_TOKEN` / `GH_TOKEN`. Enterprise via `host:`.
+- **Optional per-backend knobs:** `writable` (default true), `poll_interval`
+  (default 60s), and GitHub/git-bug `active_label` / `needs_input_label` to map
+  labels to the Active / Needs-input columns.
+- **Back-compat:** if `backends.yaml` is absent, a legacy
+  `~/.config/agent-monitor/nous.yaml` is used as a single Nous backend.
+
 ## Status Indicators
 
 | Symbol | Status | Description |
@@ -142,6 +190,7 @@ agent-monitor --no-attach
 | `focus-agent-monitor` | `~/.local/bin/` | Helper to return focus |
 | `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config |
 | `groups.yaml` | `~/.config/agent-monitor/` | Agent grouping config (optional) |
+| `backends.yaml` | `~/.config/agent-monitor/` | Kanban task backends: Nous / GitHub / git-bug (optional) |
 
 ## Requirements
 

@@ -483,6 +483,15 @@
     .badge-cx { color: #66bb6a; border: 1px solid #66bb6a44; background: #66bb6a11; }
     .badge-unknown { color: var(--text-dim); border: 1px solid #88888844; }
 
+    /* Source badges — which tracker a card came from */
+    .badge-src { text-transform: lowercase; }
+    .badge-nous { color: #cc66ff; border: 1px solid #cc66ff44; background: #cc66ff11; }
+    .badge-gh { color: #adbac7; border: 1px solid #adbac744; background: #adbac711; }
+    .badge-bug { color: #f0883e; border: 1px solid #f0883e44; background: #f0883e11; }
+
+    .card-link { color: var(--text-dim); text-decoration: none; flex-shrink: 0; font-size: 11px; }
+    .card-link:hover { color: var(--accent); }
+
     .status-dot {
       width: 7px;
       height: 7px;
@@ -1017,6 +1026,15 @@
       return map[badge] || 'badge-unknown';
     }
 
+    // Maps a task's backend source key to a short display badge.
+    function sourceBadge(source) {
+      if (!source) return null;
+      if (source === 'nous') return { label: 'nous', cls: 'badge-nous' };
+      if (source.startsWith('github:')) return { label: 'gh', cls: 'badge-gh' };
+      if (source.startsWith('git-bug:')) return { label: 'bug', cls: 'badge-bug' };
+      return { label: source, cls: 'badge-unknown' };
+    }
+
     // Nous-synced tasks all carry a "Task: " prefix — noise on a board.
     function displayTitle(title) {
       return title.replace(/^Task:\s*/, '');
@@ -1056,10 +1074,17 @@
       if (task.session_name && status) {
         html += '<span class="status-dot status-' + escapeHtml(status) + '"></span>';
       }
+      const src = sourceBadge(task.source);
+      if (src) {
+        html += '<span class="badge badge-src ' + src.cls + '">' + escapeHtml(src.label) + '</span>';
+      }
       if (badge) {
         html += '<span class="badge ' + badgeClass(badge) + '">' + escapeHtml(badge) + '</span>';
       }
       html += '<span class="card-title" title="' + escapeHtml(task.title) + '">' + escapeHtml(displayTitle(task.title)) + '</span>';
+      if (task.url) {
+        html += '<a class="card-link" href="' + escapeHtml(task.url) + '" target="_blank" rel="noopener" title="Open in tracker" onclick="event.stopPropagation()">↗</a>';
+      }
       html += '</div>';
 
       if (task.session_name || task.updated_at) {
