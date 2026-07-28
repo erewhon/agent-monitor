@@ -115,6 +115,60 @@ func (s AgentStatus) Symbol() string {
 	}
 }
 
+// WaitReason refines StatusWaiting into why the agent is blocked. It is
+// orthogonal to AgentStatus so the existing status vocabulary (and the JSON
+// it is serialized into) stays unchanged; consumers that don't know about
+// wait reasons keep seeing a plain "waiting".
+type WaitReason int
+
+const (
+	WaitNone     WaitReason = iota // not waiting, or reason not determined
+	WaitApproval                   // blocked on a tool/permission approval prompt
+	WaitInput                      // blocked on a free-text prompt or question
+)
+
+func (w WaitReason) String() string {
+	switch w {
+	case WaitApproval:
+		return "approval"
+	case WaitInput:
+		return "input"
+	default:
+		return ""
+	}
+}
+
+// Symbol returns the status glyph for a waiting agent. Approval — the urgent
+// "come back now" case — gets a fuller circle than a plain input prompt.
+// Both stay in the ◔◐ family so column widths match the other status symbols.
+func (w WaitReason) Symbol() string {
+	switch w {
+	case WaitApproval:
+		return "◕"
+	default:
+		return "◐"
+	}
+}
+
+// parseWaitReason converts a wire string ("approval" / "input") to a WaitReason.
+func parseWaitReason(s string) WaitReason {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "approval", "permission", "tool":
+		return WaitApproval
+	case "input", "prompt", "question":
+		return WaitInput
+	default:
+		return WaitNone
+	}
+}
+
+// Detection is the result of classifying a pane's content.
+type Detection struct {
+	Status AgentStatus
+	Wait   WaitReason
+	Line   string
+}
+
 // Badge returns a short label identifying the agent type.
 func (t AgentType) Badge() string {
 	switch t {
@@ -155,9 +209,19 @@ type Agent struct {
 	Pane      int    // tmux pane index
 	Type      AgentType
 	Status    AgentStatus
+	Wait      WaitReason    // why the agent is waiting (only meaningful for StatusWaiting)
 	Presence  AgentPresence // Active, NoAgent (session exists), or NoSession
 	LastLine  string        // Last line of output (for status detection)
 	UpdatedAt time.Time
+}
+
+// WaitReasonOrNone returns the wait reason only when the agent is actually
+// waiting, so a stale reason on a running agent never leaks into the UI/API.
+func (a Agent) WaitReasonOrNone() WaitReason {
+	if a.Status != StatusWaiting {
+		return WaitNone
+	}
+	return a.Wait
 }
 
 func (a Agent) Target() string {
@@ -315,8 +379,12 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // Planning frames — pulsing diamond (slower cycle via frame division)
 var planningFrames = []string{"◇", "◇", "◈", "◆", "◆", "◈"}
 
-// Waiting frames — pulsing half-circle
+// Waiting frames — pulsing half-circle (waiting on free-text input)
 var waitingFrames = []string{"◐", "◐", "◑", "◑"}
+
+// Approval frames — fuller, faster-pulsing circle for a blocked permission
+// gate. Same glyph family as waitingFrames so column widths stay aligned.
+var approvalFrames = []string{"◕", "◔", "◕", "◔"}
 
 // Gradient colors for the title — subtle purple range
 var titleGradient = []lipgloss.Color{
@@ -339,9 +407,20 @@ type NotifyEvent string
 
 const (
 	NotifyWaiting  NotifyEvent = "waiting"
+	NotifyApproval NotifyEvent = "approval" // blocked on a tool/permission gate
 	NotifyFinished NotifyEvent = "finished"
 	NotifyPlanning NotifyEvent = "planning"
 )
+
+// notifyEventForWait picks the notification event for an agent that just
+// started waiting. Approval is called out separately because it is the
+// "come back now" case — the agent is stalled mid-task until it's cleared.
+func notifyEventForWait(w WaitReason) NotifyEvent {
+	if w == WaitApproval {
+		return NotifyApproval
+	}
+	return NotifyWaiting
+}
 
 // Notification carries the data needed by all notification backends.
 type Notification struct {
@@ -355,6 +434,8 @@ func (n Notification) Title() string {
 	switch n.Event {
 	case NotifyWaiting:
 		return fmt.Sprintf("[%s] %s needs input", n.Badge, n.AgentName)
+	case NotifyApproval:
+		return fmt.Sprintf("[%s] %s needs approval", n.Badge, n.AgentName)
 	case NotifyPlanning:
 		return fmt.Sprintf("[%s] %s needs plan approval", n.Badge, n.AgentName)
 	case NotifyFinished:
@@ -420,7 +501,11 @@ func sendNtfyNotification(n Notification, server, topic string) tea.Cmd {
 			return nil
 		}
 		req.Header.Set("Title", n.Title())
-		if n.Event == NotifyWaiting {
+		if n.Event == NotifyApproval {
+			// Loudest tier: the agent is stalled until this is cleared.
+			req.Header.Set("Priority", "urgent")
+			req.Header.Set("Tags", "rotating_light")
+		} else if n.Event == NotifyWaiting {
 			req.Header.Set("Priority", "high")
 			req.Header.Set("Tags", "warning")
 		} else {
@@ -508,15 +593,19 @@ func (s *SharedState) GetGroups() []Group {
 
 // API response types — JSON-friendly representations of internal state
 type apiAgent struct {
-	Name      string    `json:"name"`
-	Session   string    `json:"session"`
-	Target    string    `json:"target"`
-	Type      string    `json:"type"`
-	Badge     string    `json:"badge"`
-	Status    string    `json:"status"`
-	Presence  string    `json:"presence"`
-	LastLine  string    `json:"last_line,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name    string `json:"name"`
+	Session string `json:"session"`
+	Target  string `json:"target"`
+	Type    string `json:"type"`
+	Badge   string `json:"badge"`
+	Status  string `json:"status"`
+	// WaitReason refines status=="waiting" into "approval" or "input".
+	// Additive: omitted when there is no reason, so existing clients that
+	// only read "status" are unaffected.
+	WaitReason string    `json:"wait_reason,omitempty"`
+	Presence   string    `json:"presence"`
+	LastLine   string    `json:"last_line,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type apiGroup struct {
@@ -543,15 +632,16 @@ func toAPIAgent(a Agent) apiAgent {
 		presence = "no_session"
 	}
 	return apiAgent{
-		Name:      a.Name,
-		Session:   a.Session,
-		Target:    a.Target(),
-		Type:      string(a.Type),
-		Badge:     a.Type.Badge(),
-		Status:    a.Status.String(),
-		Presence:  presence,
-		LastLine:  a.LastLine,
-		UpdatedAt: a.UpdatedAt,
+		Name:       a.Name,
+		Session:    a.Session,
+		Target:     a.Target(),
+		Type:       string(a.Type),
+		Badge:      a.Type.Badge(),
+		Status:     a.Status.String(),
+		WaitReason: a.WaitReasonOrNone().String(),
+		Presence:   presence,
+		LastLine:   a.LastLine,
+		UpdatedAt:  a.UpdatedAt,
 	}
 }
 
@@ -975,12 +1065,61 @@ func (ts *TaskStore) AutoLink(agents []Agent, hub *SSEHub) {
 
 // WebhookState holds the last push-based state for an agent session.
 type WebhookState struct {
-	Session   string    `json:"session"`
-	AgentType string    `json:"agent_type"`
-	Status    string    `json:"status"`
+	Session   string `json:"session"`
+	AgentType string `json:"agent_type"`
+	Status    string `json:"status"`
+	// WaitReason refines status=="waiting": "approval" or "input". Optional —
+	// when empty it is inferred from Status (e.g. "waiting-approval") or from
+	// HookEvent, and failing that the pane heuristics decide.
+	WaitReason string `json:"wait_reason,omitempty"`
+	// HookEvent is the Claude Code hook name that fired ("PreToolUse",
+	// "Notification", "Stop", …). Lets a hook post its raw event without
+	// having to map it to a status/reason itself.
+	HookEvent string    `json:"hook_event,omitempty"`
 	Detail    string    `json:"detail,omitempty"`
 	Host      string    `json:"host,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// permissionMessage matches the wording Claude Code's Notification hook uses
+// when the notification is a permission request rather than an idle prompt
+// ("Claude needs your permission to use Bash").
+var permissionMessage = regexp.MustCompile(`(?i)\b(permission|approve|approval|allow .* to use)\b`)
+
+// waitReasonFromHook maps a Claude Code hook event (plus its message detail)
+// to a wait reason. PreToolUse fires when a tool is about to run — if the
+// agent then blocks, it is blocked on that tool's permission prompt.
+// Notification covers both permission requests and plain idle prompts, so the
+// message text is what separates them.
+func waitReasonFromHook(event, detail string) WaitReason {
+	switch strings.ToLower(strings.TrimSpace(event)) {
+	case "pretooluse", "permissionrequest", "permission_request":
+		return WaitApproval
+	case "notification":
+		if permissionMessage.MatchString(detail) {
+			return WaitApproval
+		}
+		return WaitInput
+	case "userpromptsubmit", "stop", "subagentstop":
+		return WaitInput
+	default:
+		return WaitNone
+	}
+}
+
+// resolvedWait derives the wait reason for a webhook state, preferring the
+// explicit field, then a compound status string, then the hook event name.
+func (s WebhookState) resolvedWait() WaitReason {
+	if w := parseWaitReason(s.WaitReason); w != WaitNone {
+		return w
+	}
+	if _, w := parseWebhookStatusFull(s.Status); w != WaitNone {
+		return w
+	}
+	if parseWebhookStatus(s.Status) == StatusWaiting {
+		return waitReasonFromHook(s.HookEvent, s.Detail)
+	}
+	return WaitNone
 }
 
 // WebhookStore tracks push-based agent state from hooks.
@@ -1029,6 +1168,7 @@ func (ws *WebhookStore) GetRemoteAgents() []Agent {
 			Session:   state.Session,
 			Type:      parseWebhookAgentType(state.AgentType),
 			Status:    parseWebhookStatus(state.Status),
+			Wait:      state.resolvedWait(),
 			Presence:  PresenceActive,
 			LastLine:  state.Detail,
 			UpdatedAt: state.Timestamp,
@@ -1048,19 +1188,35 @@ func isLocalhost(r *http.Request) bool {
 
 // parseWebhookStatus converts a webhook status string to AgentStatus.
 func parseWebhookStatus(s string) AgentStatus {
+	status, _ := parseWebhookStatusFull(s)
+	return status
+}
+
+// parseWebhookStatusFull converts a webhook status string to an AgentStatus
+// plus (for the compound "waiting-approval"/"waiting-input" forms) a reason.
+// Separators are normalized so "waiting_approval" and "waiting:approval" work too.
+func parseWebhookStatusFull(s string) (AgentStatus, WaitReason) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, sep := range []string{"_", ":", " "} {
+		s = strings.ReplaceAll(s, sep, "-")
+	}
 	switch s {
 	case "running":
-		return StatusRunning
+		return StatusRunning, WaitNone
 	case "waiting":
-		return StatusWaiting
+		return StatusWaiting, WaitNone
+	case "waiting-approval", "approval":
+		return StatusWaiting, WaitApproval
+	case "waiting-input", "input":
+		return StatusWaiting, WaitInput
 	case "idle":
-		return StatusIdle
+		return StatusIdle, WaitNone
 	case "planning":
-		return StatusPlanning
+		return StatusPlanning, WaitNone
 	case "error":
-		return StatusError
+		return StatusError, WaitNone
 	default:
-		return StatusUnknown
+		return StatusUnknown, WaitNone
 	}
 }
 
@@ -1093,6 +1249,13 @@ func mergeWebhookState(agents []Agent, ws *WebhookStore) {
 		newStatus := parseWebhookStatus(state.Status)
 		if newStatus != StatusUnknown {
 			agents[i].Status = newStatus
+			// Hook-derived reasons are exact; only fall back to the pane
+			// heuristic's reason when the hook didn't carry one.
+			if w := state.resolvedWait(); w != WaitNone {
+				agents[i].Wait = w
+			} else if newStatus != StatusWaiting {
+				agents[i].Wait = WaitNone
+			}
 		}
 		if state.Detail != "" {
 			agents[i].LastLine = state.Detail
@@ -1891,6 +2054,18 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 	server.ListenAndServe()
 }
 
+// agentState is the transition-detection key: a status plus, when waiting,
+// the reason. Comparing the pair means an input→approval escalation counts as
+// a transition and gets its own (louder) notification.
+type agentState struct {
+	Status AgentStatus
+	Wait   WaitReason
+}
+
+func stateOf(a Agent) agentState {
+	return agentState{Status: a.Status, Wait: a.WaitReasonOrNone()}
+}
+
 // Model is the Bubble Tea model
 type Model struct {
 	agents              []Agent
@@ -1901,30 +2076,30 @@ type Model struct {
 	attached            string // Currently attached agent target
 	err                 error
 	quitting            bool
-	config              Config                 // Loaded group config
-	groups              []Group                // Computed groups for display
-	flatAgents          []Agent                // Flattened agent list in display order (cursor indexes into this)
-	spinnerFrame        int                    // Animation frame counter
-	spinnerActive       bool                   // Whether a spinner tick chain is running
-	showActivity        bool                   // Toggle: show last activity line under each agent
-	lastActiveAt        map[string]time.Time   // session -> when last seen in an active state
-	filterGroups        map[string]bool        // If non-nil, only show these group names
-	previousStatus      map[string]AgentStatus // session -> last known status (for transition detection)
-	pendingTransition   map[string]AgentStatus // session -> status seen once but not yet confirmed (debounce)
-	planPendingApproval map[string]bool        // sessions seen in planning, awaiting auto-approval
-	favorites           map[string]bool        // session name -> is favorite
-	filterFavorites     bool                   // when true, only show favorited agents
-	collapsed           map[string]bool        // group name -> collapsed (header shown, items hidden)
-	groupByStatus       bool                   // when true, bucket agents by status instead of config groups
-	scrollOffset        int                    // viewport scroll offset for agent list
-	gridMode            bool                   // grid mode active (2x2 pane layout)
-	gridSlot            int                    // active grid slot (0-3)
-	gridPaneIDs         [4]string              // tmux pane IDs (%N) for each grid cell
-	gridAgents          [4]string              // agent target in each slot ("" = empty)
-	sharedState         *SharedState           // shared state for HTTP API (nil if --no-web)
-	sseHub              *SSEHub                // SSE event hub (nil if --no-web)
-	taskStore           *TaskStore             // persistent task storage (nil if --no-web)
-	webhookStore        *WebhookStore          // push-based agent state (nil if --no-web)
+	config              Config                // Loaded group config
+	groups              []Group               // Computed groups for display
+	flatAgents          []Agent               // Flattened agent list in display order (cursor indexes into this)
+	spinnerFrame        int                   // Animation frame counter
+	spinnerActive       bool                  // Whether a spinner tick chain is running
+	showActivity        bool                  // Toggle: show last activity line under each agent
+	lastActiveAt        map[string]time.Time  // session -> when last seen in an active state
+	filterGroups        map[string]bool       // If non-nil, only show these group names
+	previousStatus      map[string]agentState // session -> last known state (for transition detection)
+	pendingTransition   map[string]agentState // session -> state seen once but not yet confirmed (debounce)
+	planPendingApproval map[string]bool       // sessions seen in planning, awaiting auto-approval
+	favorites           map[string]bool       // session name -> is favorite
+	filterFavorites     bool                  // when true, only show favorited agents
+	collapsed           map[string]bool       // group name -> collapsed (header shown, items hidden)
+	groupByStatus       bool                  // when true, bucket agents by status instead of config groups
+	scrollOffset        int                   // viewport scroll offset for agent list
+	gridMode            bool                  // grid mode active (2x2 pane layout)
+	gridSlot            int                   // active grid slot (0-3)
+	gridPaneIDs         [4]string             // tmux pane IDs (%N) for each grid cell
+	gridAgents          [4]string             // agent target in each slot ("" = empty)
+	sharedState         *SharedState          // shared state for HTTP API (nil if --no-web)
+	sseHub              *SSEHub               // SSE event hub (nil if --no-web)
+	taskStore           *TaskStore            // persistent task storage (nil if --no-web)
+	webhookStore        *WebhookStore         // push-based agent state (nil if --no-web)
 }
 
 // Messages
@@ -1965,6 +2140,10 @@ var (
 
 	statusWaiting = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("220")) // Yellow
+
+	statusApproval = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("208")). // Orange — louder than plain waiting
+			Bold(true)
 
 	statusPlanning = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("141")) // Light purple
@@ -2025,8 +2204,8 @@ func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore
 		outerSocket:         *outerSocket,
 		config:              loadConfig(),
 		lastActiveAt:        make(map[string]time.Time),
-		previousStatus:      make(map[string]AgentStatus),
-		pendingTransition:   make(map[string]AgentStatus),
+		previousStatus:      make(map[string]agentState),
+		pendingTransition:   make(map[string]agentState),
 		planPendingApproval: make(map[string]bool),
 		favorites:           loadFavorites(),
 		collapsed:           loadCollapsed(),
@@ -2200,10 +2379,22 @@ type statusBucket struct {
 	match func(m *Model, a Agent) bool
 }
 
+// Group names used by the status lens. Approval sorts first: those agents are
+// stalled mid-task, while an input prompt can usually wait a moment longer.
+const (
+	bucketApproval = "Needs approval"
+	bucketWaiting  = "Waiting"
+)
+
 // statusBuckets defines the display order of status groups: agents that need
 // attention (waiting, error) sort above active ones, with idle at the bottom.
 var statusBuckets = []statusBucket{
-	{"Waiting", func(m *Model, a Agent) bool { return a.Status == StatusWaiting }},
+	{bucketApproval, func(m *Model, a Agent) bool {
+		return a.Status == StatusWaiting && a.Wait == WaitApproval
+	}},
+	{bucketWaiting, func(m *Model, a Agent) bool {
+		return a.Status == StatusWaiting && a.Wait != WaitApproval
+	}},
 	{"Error", func(m *Model, a Agent) bool { return a.Status == StatusError }},
 	{"Running", func(m *Model, a Agent) bool { return a.Status == StatusRunning }},
 	{"Planning", func(m *Model, a Agent) bool { return a.Status == StatusPlanning }},
@@ -2478,7 +2669,8 @@ func detectAgents() tea.Msg {
 			UpdatedAt: time.Now(),
 		}
 
-		agent.Status, agent.LastLine = detectAgentStatus(p.target, agentType)
+		det := detectAgentStatus(p.target, agentType)
+		agent.Status, agent.Wait, agent.LastLine = det.Status, det.Wait, det.Line
 		agents = append(agents, agent)
 	}
 
@@ -2607,22 +2799,17 @@ func looksLikeCodex(target string) bool {
 // detectCodexStatus captures pane content and determines OpenAI Codex agent state.
 // Codex is a Node.js TUI with a box-drawn header showing "OpenAI Codex".
 // Idle state: "›" prompt visible, "? for shortcuts", "context left" in bottom bar.
-func detectCodexStatus(target string) (AgentStatus, string) {
-	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
-	output, err := cmd.Output()
-	if err != nil {
-		return StatusError, ""
+func detectCodexStatus(target string) Detection {
+	content, ok := capturePane(target)
+	if !ok {
+		return Detection{Status: StatusError}
 	}
+	return classifyCodexStatus(content)
+}
 
-	lines := strings.Split(string(output), "\n")
-
-	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line != "" {
-			lastLines = append([]string{line}, lastLines...)
-		}
-	}
+// classifyCodexStatus determines Codex agent state from pane content.
+func classifyCodexStatus(content string) Detection {
+	lastLines := recentLines(content, 20)
 
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
@@ -2641,17 +2828,17 @@ func detectCodexStatus(target string) (AgentStatus, string) {
 
 	// Running: active thinking/working with timing — "• Something (19s • esc to interrupt)"
 	if strings.Contains(recentContent, "esc to interrupt") {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	if !isIdle {
 		// Running: tool execution lines — "• Ran ..." at line start
 		if regexp.MustCompile(`(?m)^• Ran\s+`).MatchString(recentContent) {
-			return StatusRunning, truncate(activityLine, 60)
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 		}
 		// Running: spinner or active work indicators
 		if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
-			return StatusRunning, truncate(activityLine, 60)
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 		}
 		runningPatterns := []string{
 			"Working...", "Thinking...", "Generating...",
@@ -2659,37 +2846,42 @@ func detectCodexStatus(target string) (AgentStatus, string) {
 		}
 		for _, pat := range runningPatterns {
 			if strings.Contains(recentContent, pat) {
-				return StatusRunning, truncate(activityLine, 60)
+				return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 			}
 		}
 		// Running: sandbox execution
 		if strings.Contains(recentContent, "Running command") ||
 			strings.Contains(recentContent, "Applying patch") {
-			return StatusRunning, truncate(activityLine, 60)
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 		}
 	}
 
-	// Waiting: permission / approval prompts
-	waitingPatterns := []string{
-		"[y/n]", "[Y/n]", "(y/n)",
-		"Allow", "Deny",
-		"approve", "reject",
+	// Waiting: approval gates first (the specific markers), then plain prompts.
+	// Approval markers are line-start-anchored because "• Ran"-style scrollback
+	// can carry the words "allow"/"approve" from earlier output.
+	if codexApprovalPattern.MatchString(recentContent) {
+		return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 	}
-	for _, pat := range waitingPatterns {
+	for _, pat := range []string{"[y/n]", "[Y/n]", "(y/n)"} {
 		if strings.Contains(recentContent, pat) {
-			return StatusWaiting, truncate(activityLine, 60)
+			return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 		}
 	}
 
 	if isIdle {
-		return StatusIdle, truncate(activityLine, 60)
+		return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 	}
 
-	return StatusIdle, truncate(activityLine, 60)
+	return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 }
 
+// codexApprovalPattern matches Codex's approval prompt controls. Anchored at
+// line start (allowing box chrome) so the words don't match inside the "• Ran"
+// output that persists in scrollback after Codex goes idle.
+var codexApprovalPattern = regexp.MustCompile(`(?mi)^` + paneChrome + `[❯>›]?\s*(\d+\.\s*)?(Allow|Deny|Approve|Reject)\b`)
+
 // detectAgentStatus dispatches to the appropriate status detector by agent type.
-func detectAgentStatus(target string, agentType AgentType) (AgentStatus, string) {
+func detectAgentStatus(target string, agentType AgentType) Detection {
 	switch agentType {
 	case AgentCrush:
 		return detectCrushStatus(target)
@@ -2702,25 +2894,45 @@ func detectAgentStatus(target string, agentType AgentType) (AgentStatus, string)
 	}
 }
 
-// detectClaudeStatus captures pane content and determines Claude Code agent state.
-func detectClaudeStatus(target string) (AgentStatus, string) {
+// capturePane grabs a pane's visible content, or reports failure.
+func capturePane(target string) (string, bool) {
 	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
 	output, err := cmd.Output()
 	if err != nil {
-		return StatusError, ""
+		return "", false
 	}
+	return string(output), true
+}
 
-	lines := strings.Split(string(output), "\n")
-
-	// Collect last 20 non-empty lines for pattern matching.
-	// Needs to be large enough to see past task checklists that appear below the spinner.
-	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
+// recentLines returns the last n non-empty, trimmed lines of pane content in
+// original order. All the classifiers match against this window rather than
+// the whole scrollback.
+func recentLines(content string, n int) []string {
+	lines := strings.Split(content, "\n")
+	var out []string
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line != "" {
-			lastLines = append([]string{line}, lastLines...)
+			out = append([]string{line}, out...)
 		}
 	}
+	return out
+}
+
+// detectClaudeStatus captures pane content and determines Claude Code agent state.
+func detectClaudeStatus(target string) Detection {
+	content, ok := capturePane(target)
+	if !ok {
+		return Detection{Status: StatusError}
+	}
+	return classifyClaudeStatus(content)
+}
+
+// classifyClaudeStatus determines Claude Code agent state from pane content.
+func classifyClaudeStatus(content string) Detection {
+	// Collect last 20 non-empty lines for pattern matching.
+	// Needs to be large enough to see past task checklists that appear below the spinner.
+	lastLines := recentLines(content, 20)
 
 	var lastLine string
 	if len(lastLines) > 0 {
@@ -2741,63 +2953,114 @@ func detectClaudeStatus(target string) (AgentStatus, string) {
 	// Match any line with "…" followed by a parenthesized duration.
 	activeSpinner := regexp.MustCompile(`(?m)…\s+\(\d+[ms]`)
 	if activeSpinner.MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// Also match spinner lines by prefix char + text + … (without timing, for early display)
 	activeSpinnerAlt := regexp.MustCompile(`(?m)^[✻✢✶✦✧✹✺✵✷❋❊⚝*]\s+.+…`)
 	if activeSpinnerAlt.MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// Tool execution: ⎿ at line start followed by Running
 	if regexp.MustCompile(`(?m)^⎿\s+Running`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// Subagent execution: "Running N ... agents…" at line start
 	if regexp.MustCompile(`(?m)^●\s+Running\s+\d+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// Streaming indicators at line start (e.g. "* Thinking…" shown during generation)
 	if regexp.MustCompile(`(?m)^\*\s+(Thinking|Waiting)…`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// --- UI states (checked on wider recent content) ---
 
-	// Waiting for PERMISSION: shows selection prompt for approval
-	permissionPatterns := []string{
-		"Do you want to proceed?",
-		"Do you want to make this edit",
-		"Yes, and don't ask",
-		"Esc to cancel",
-		"❯ 1.",
-		"❯ 2.",
-		"[y/N]",
-		"(y/n)",
-		"Press Enter",
-		"Tab to amend",
-	}
-	for _, pattern := range permissionPatterns {
-		if strings.Contains(recentContent, pattern) {
-			return StatusWaiting, truncate(activityLine, 60)
-		}
+	// Waiting: split into approval (a tool/permission gate the operator must
+	// clear) vs input (a question or free-text prompt). Approval is checked
+	// first because its markers are the specific ones — a permission dialog
+	// also renders the generic "Esc to cancel" chrome that signals input.
+	if w := classifyClaudeWait(recentContent); w != WaitNone {
+		return Detection{StatusWaiting, w, truncate(activityLine, 60)}
 	}
 
 	// Plan mode: agent is exploring/designing.
 	// Line-start-anchored to avoid matching "plan mode" in conversation text.
 	if regexp.MustCompile(`(?m)^\s*plan mode`).MatchString(recentContent) {
-		return StatusPlanning, truncate(activityLine, 60)
+		return Detection{StatusPlanning, WaitNone, truncate(activityLine, 60)}
 	}
 
 	// Idle at prompt: ready for new command input
 	if strings.Contains(lastLine, "⏵⏵") || strings.Contains(lastLine, "accept edits") {
-		return StatusIdle, truncate(activityLine, 60)
+		return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 	}
 
-	return StatusIdle, truncate(activityLine, 60)
+	return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
+}
+
+// claudeApprovalPatterns mark a permission/tool-approval gate: Claude has
+// stopped mid-task and needs an explicit yes/no before it can continue.
+var claudeApprovalPatterns = []string{
+	"Do you want to proceed?",
+	"Do you want to make this edit",
+	"Do you want to create",
+	"Do you want to run",
+	"Do you want to delete",
+	"Yes, and don't ask",
+	"Yes, allow all edits",
+	"No, and tell Claude what to do differently",
+	"Allow this tool",
+	"[y/N]",
+	"(y/n)",
+}
+
+// claudeInputPatterns mark a plain prompt or question — Claude is asking
+// something rather than gating on a permission decision.
+var claudeInputPatterns = []string{
+	"Esc to cancel",
+	"Press Enter",
+	"Tab to amend",
+}
+
+// paneChrome matches the leading box border / bracket decoration a TUI draws
+// before the interactive part of a line. Approval markers are anchored with it
+// so the words can't match inside conversational output or stale scrollback
+// (see the "• Ran" persistence note on Codex).
+const paneChrome = `[│┃|╎┊\[\(\s]*`
+
+// claudeSelectMenu matches the numbered selection menu Claude renders for both
+// permission dialogs and multiple-choice questions ("❯ 1. Yes").
+var claudeSelectMenu = regexp.MustCompile(`(?m)^` + paneChrome + `❯\s*\d+\.`)
+
+// claudeApprovalChoice matches the affirmative first option of a permission
+// dialog, which is what separates it from a multiple-choice question.
+var claudeApprovalChoice = regexp.MustCompile(`(?mi)^` + paneChrome + `❯?\s*1\.\s*(Yes|Allow|Approve|Accept)`)
+
+// classifyClaudeWait decides why a Claude pane is blocked, returning WaitNone
+// when nothing indicates it is waiting at all.
+func classifyClaudeWait(recentContent string) WaitReason {
+	for _, pattern := range claudeApprovalPatterns {
+		if strings.Contains(recentContent, pattern) {
+			return WaitApproval
+		}
+	}
+	// A numbered menu is an approval gate when it offers a yes/allow option,
+	// otherwise it is a multiple-choice question addressed to the operator.
+	if claudeSelectMenu.MatchString(recentContent) {
+		if claudeApprovalChoice.MatchString(recentContent) {
+			return WaitApproval
+		}
+		return WaitInput
+	}
+	for _, pattern := range claudeInputPatterns {
+		if strings.Contains(recentContent, pattern) {
+			return WaitInput
+		}
+	}
+	return WaitNone
 }
 
 // findActivityLine scans recent lines bottom-up for a meaningful content line,
@@ -2864,22 +3127,17 @@ func findActivityLine(lines []string) string {
 }
 
 // detectCrushStatus captures pane content and determines Crush agent state.
-func detectCrushStatus(target string) (AgentStatus, string) {
-	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
-	output, err := cmd.Output()
-	if err != nil {
-		return StatusError, ""
+func detectCrushStatus(target string) Detection {
+	content, ok := capturePane(target)
+	if !ok {
+		return Detection{Status: StatusError}
 	}
+	return classifyCrushStatus(content)
+}
 
-	lines := strings.Split(string(output), "\n")
-
-	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line != "" {
-			lastLines = append([]string{line}, lastLines...)
-		}
-	}
+// classifyCrushStatus determines Crush agent state from pane content.
+func classifyCrushStatus(content string) Detection {
+	lastLines := recentLines(content, 20)
 
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
@@ -2891,22 +3149,21 @@ func detectCrushStatus(target string) (AgentStatus, string) {
 	}
 	for _, pat := range runningPatterns {
 		if strings.Contains(recentContent, pat) {
-			return StatusRunning, truncate(activityLine, 60)
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 		}
 	}
 	// Spinner animation (Bubble Tea spinners)
 	if regexp.MustCompile(`(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 
-	// Waiting: permission dialogs
-	waitingPatterns := []string{
-		"Allow", "Deny",
-		"[y/n]", "[Y/n]", "(y/n)",
+	// Waiting: permission dialogs are approval gates
+	if crushApprovalPattern.MatchString(recentContent) {
+		return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 	}
-	for _, pat := range waitingPatterns {
+	for _, pat := range []string{"[y/n]", "[Y/n]", "(y/n)"} {
 		if strings.Contains(recentContent, pat) {
-			return StatusWaiting, truncate(activityLine, 60)
+			return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 		}
 	}
 
@@ -2919,11 +3176,16 @@ func detectCrushStatus(target string) (AgentStatus, string) {
 		strings.Contains(recentContent, "Ready!") ||
 		strings.Contains(recentContent, "Ready...") ||
 		strings.Contains(recentContent, "Ready for instructions") {
-		return StatusIdle, truncate(activityLine, 60)
+		return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 	}
 
-	return StatusIdle, truncate(activityLine, 60)
+	return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 }
+
+// crushApprovalPattern matches Crush's Allow/Deny permission dialog buttons,
+// anchored at line start (allowing box chrome) to avoid matching the words
+// inside conversational output.
+var crushApprovalPattern = regexp.MustCompile(`(?mi)^` + paneChrome + `[❯>›]?\s*(\d+\.\s*)?(Allow|Deny)\b`)
 
 // detectOpenCodeStatus captures pane content and determines OpenCode agent state.
 // OpenCode is a Bubble Tea TUI with a status bar at bottom showing "• OpenCode X.Y.Z".
@@ -2932,38 +3194,32 @@ func detectCrushStatus(target string) (AgentStatus, string) {
 //   - Tool call lines prefixed with ✱ (e.g. "✱ Glob ...")
 //
 // Idle state: bottom bar shows "tab switch agent" / "tab agents"
-func detectOpenCodeStatus(target string) (AgentStatus, string) {
-	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p")
-	output, err := cmd.Output()
-	if err != nil {
-		return StatusError, ""
+func detectOpenCodeStatus(target string) Detection {
+	content, ok := capturePane(target)
+	if !ok {
+		return Detection{Status: StatusError}
 	}
+	return classifyOpenCodeStatus(content)
+}
 
-	content := string(output)
-	lines := strings.Split(content, "\n")
-
-	var lastLines []string
-	for i := len(lines) - 1; i >= 0 && len(lastLines) < 20; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line != "" {
-			lastLines = append([]string{line}, lastLines...)
-		}
-	}
+// classifyOpenCodeStatus determines OpenCode agent state from pane content.
+func classifyOpenCodeStatus(content string) Detection {
+	lastLines := recentLines(content, 20)
 
 	activityLine := findActivityLine(lastLines)
 	recentContent := strings.Join(lastLines, "\n")
 
 	// Running: "esc interrupt" in bottom bar — definitive running indicator
 	if strings.Contains(recentContent, "esc interrupt") {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 	// Running: progress bar with filled/empty squares
 	if strings.Contains(recentContent, "■") || strings.Contains(recentContent, "⬝") {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 	// Running: tool call lines (✱ prefix)
 	if regexp.MustCompile(`(?m)^✱\s+`).MatchString(recentContent) {
-		return StatusRunning, truncate(activityLine, 60)
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 	}
 	// Running: explicit status text
 	runningPatterns := []string{
@@ -2971,24 +3227,27 @@ func detectOpenCodeStatus(target string) (AgentStatus, string) {
 	}
 	for _, pat := range runningPatterns {
 		if strings.Contains(recentContent, pat) {
-			return StatusRunning, truncate(activityLine, 60)
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
 		}
 	}
 
-	// Waiting: permission dialogs
-	waitingPatterns := []string{
-		"[y/n]", "[Y/n]", "(y/n)",
-		"allow", "deny",
+	// Waiting: permission dialogs are approval gates
+	if openCodeApprovalPattern.MatchString(recentContent) {
+		return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 	}
-	for _, pat := range waitingPatterns {
+	for _, pat := range []string{"[y/n]", "[Y/n]", "(y/n)"} {
 		if strings.Contains(recentContent, pat) {
-			return StatusWaiting, truncate(activityLine, 60)
+			return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
 		}
 	}
 
 	// Idle: default state (OpenCode TUI is visible but not actively working)
-	return StatusIdle, truncate(activityLine, 60)
+	return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
 }
+
+// openCodeApprovalPattern matches OpenCode's allow/deny permission controls,
+// anchored at line start so the words don't match inside response text.
+var openCodeApprovalPattern = regexp.MustCompile(`(?mi)^` + paneChrome + `[❯>›]?\s*(\d+\.\s*)?(allow|deny)\b`)
 
 func truncate(s string, maxLen int) string {
 	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -3244,7 +3503,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// prevents spurious alerts when detection briefly flickers (e.g.
 		// agent momentarily appears idle between tool calls).
 		var toastCmds []tea.Cmd
-		newPending := make(map[string]AgentStatus)
+		newPending := make(map[string]agentState)
 		for _, a := range m.agents {
 			// Skip notifications for the currently attached/focused agent(s)
 			if m.gridMode {
@@ -3265,17 +3524,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !known {
 				continue
 			}
-			// No transition from previous confirmed status — clear any pending
-			if a.Status == prev {
+			cur := stateOf(a)
+			// No transition from previous confirmed state — clear any pending
+			if cur == prev {
 				continue
 			}
-			// Status differs from previous confirmed status.
+			// State differs from previous confirmed state.
 			// Check if this was already pending (seen on last poll too).
 			pending, wasPending := m.pendingTransition[a.Session]
-			if wasPending && pending == a.Status {
-				// Confirmed: same new status for 2 consecutive polls — fire notifications
-				// Waiting transition: tmux toast + desktop notification
-				if prev != StatusWaiting && a.Status == StatusWaiting {
+			if wasPending && pending == cur {
+				// Confirmed: same new state for 2 consecutive polls — fire notifications.
+				// Waiting transition: tmux toast + desktop notification. Also fires
+				// when an already-waiting agent escalates from input to approval.
+				enteredWaiting := prev.Status != StatusWaiting && cur.Status == StatusWaiting
+				escalated := prev.Status == StatusWaiting && cur.Status == StatusWaiting &&
+					prev.Wait != WaitApproval && cur.Wait == WaitApproval
+				if enteredWaiting || escalated {
 					toast := Toast{
 						AgentName: a.Name,
 						Message:   a.LastLine,
@@ -3287,12 +3551,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					toastCmds = append(toastCmds, dispatchNotification(Notification{
 						AgentName: a.Name,
 						Badge:     a.Type.Badge(),
-						Event:     NotifyWaiting,
+						Event:     notifyEventForWait(cur.Wait),
 						Message:   a.LastLine,
 					}, m.outerSocket)...)
 				}
 				// Planning transition
-				if prev != StatusPlanning && a.Status == StatusPlanning {
+				if prev.Status != StatusPlanning && cur.Status == StatusPlanning {
 					toastCmds = append(toastCmds, dispatchNotification(Notification{
 						AgentName: a.Name,
 						Badge:     a.Type.Badge(),
@@ -3301,7 +3565,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}, m.outerSocket)...)
 				}
 				// Finished transition: running/planning → idle
-				if (prev == StatusRunning || prev == StatusPlanning) && a.Status == StatusIdle {
+				if (prev.Status == StatusRunning || prev.Status == StatusPlanning) && cur.Status == StatusIdle {
 					toastCmds = append(toastCmds, dispatchNotification(Notification{
 						AgentName: a.Name,
 						Badge:     a.Type.Badge(),
@@ -3311,23 +3575,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				// First time seeing this transition — record as pending, don't notify yet
-				newPending[a.Session] = a.Status
+				newPending[a.Session] = cur
 			}
 		}
 		m.pendingTransition = newPending
-		// Rebuild previousStatus: only update to new status once confirmed
+		// Rebuild previousStatus: only update to new state once confirmed
 		// (i.e. when the transition was NOT just recorded as pending)
-		newStatus := make(map[string]AgentStatus, len(m.agents))
+		newStatus := make(map[string]agentState, len(m.agents))
 		for _, a := range m.agents {
-			if pendingStatus, isPending := newPending[a.Session]; isPending && pendingStatus == a.Status {
-				// Still pending confirmation — keep previous status
+			cur := stateOf(a)
+			if pendingState, isPending := newPending[a.Session]; isPending && pendingState == cur {
+				// Still pending confirmation — keep previous state
 				if prev, ok := m.previousStatus[a.Session]; ok {
 					newStatus[a.Session] = prev
 				} else {
-					newStatus[a.Session] = a.Status
+					newStatus[a.Session] = cur
 				}
 			} else {
-				newStatus[a.Session] = a.Status
+				newStatus[a.Session] = cur
 			}
 		}
 		m.previousStatus = newStatus
@@ -3900,6 +4165,10 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 		frame := planningFrames[m.spinnerFrame%len(planningFrames)]
 		return statusPlanning.Render(frame)
 	case StatusWaiting:
+		if agent.Wait == WaitApproval {
+			frame := approvalFrames[m.spinnerFrame%len(approvalFrames)]
+			return statusApproval.Render(frame)
+		}
 		frame := waitingFrames[m.spinnerFrame%len(waitingFrames)]
 		return statusWaiting.Render(frame)
 	case StatusIdle:
@@ -4029,9 +4298,9 @@ func (m Model) renderGradientTitle(text string) string {
 }
 
 // renderStatusSummary renders a compact colored status summary line using symbols.
-// Format: ●2 ◇1 ◐1 ✓3 ○5  (only non-zero counts shown)
+// Format: ●2 ◇1 ◕1 ◐1 ✓3 ○5  (only non-zero counts shown)
 func (m Model) renderStatusSummary() string {
-	var running, planning, waiting, idle, recentIdle, errCount int
+	var running, planning, approval, waiting, idle, recentIdle, errCount int
 	// Count across all groups (not m.flatAgents) so collapsed groups still
 	// contribute to the global summary line.
 	for _, g := range m.groups {
@@ -4045,7 +4314,11 @@ func (m Model) renderStatusSummary() string {
 			case StatusPlanning:
 				planning++
 			case StatusWaiting:
-				waiting++
+				if a.Wait == WaitApproval {
+					approval++
+				} else {
+					waiting++
+				}
 			case StatusIdle:
 				if m.isRecentlyIdle(a) {
 					recentIdle++
@@ -4064,6 +4337,9 @@ func (m Model) renderStatusSummary() string {
 	}
 	if planning > 0 {
 		parts = append(parts, statusPlanning.Render(fmt.Sprintf("◇%d", planning)))
+	}
+	if approval > 0 {
+		parts = append(parts, statusApproval.Render(fmt.Sprintf("◕%d", approval)))
 	}
 	if waiting > 0 {
 		parts = append(parts, statusWaiting.Render(fmt.Sprintf("◐%d", waiting)))
@@ -4090,7 +4366,9 @@ func (m Model) renderStatusSummary() string {
 func (m Model) groupHeaderColor(name string, gi int) lipgloss.Color {
 	if m.groupByStatus {
 		switch name {
-		case "Waiting":
+		case bucketApproval:
+			return lipgloss.Color("208")
+		case bucketWaiting:
 			return lipgloss.Color("220")
 		case "Error":
 			return lipgloss.Color("196")
@@ -4370,15 +4648,20 @@ func main() {
 		port := *webPort
 		hookScript := fmt.Sprintf(`#!/bin/bash
 # agent-monitor hook — posts state changes to the webhook endpoint
-# Usage: agent-monitor-hook <status> [detail]
+# Usage: agent-monitor-hook <status> [detail] [hook-event]
+#   status:     running | waiting | waiting-approval | waiting-input | idle | planning | error
+#   hook-event: the Claude Code hook name (PreToolUse, Notification, Stop, …).
+#               When given, the server derives the waiting sub-state from it,
+#               so a plain "waiting" status is enough.
 # Install: agent-monitor hooks install
 SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
 [ -z "$SESSION" ] && exit 0
 STATUS="${1:-running}"
 DETAIL="${2:-}"
+EVENT="${3:-}"
 curl -sX POST http://localhost:%d/api/webhook \
   -H 'Content-Type: application/json' \
-  -d "{\"session\":\"$SESSION\",\"agent_type\":\"claude\",\"status\":\"$STATUS\",\"detail\":\"$DETAIL\"}" &>/dev/null &`, port)
+  -d "{\"session\":\"$SESSION\",\"agent_type\":\"claude\",\"status\":\"$STATUS\",\"detail\":\"$DETAIL\",\"hook_event\":\"$EVENT\"}" &>/dev/null &`, port)
 
 		hookConfig := fmt.Sprintf(`Add to ~/.claude/settings.json under "hooks":
 
@@ -4393,7 +4676,7 @@ curl -sX POST http://localhost:%d/api/webhook \
     "Notification": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\"}\" &>/dev/null &"
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\",\\\"hook_event\\\":\\\"Notification\\\",\\\"detail\\\":\\\"$CLAUDE_NOTIFICATION\\\"}\" &>/dev/null &"
       }
     ],
     "Stop": [
@@ -4403,7 +4686,16 @@ curl -sX POST http://localhost:%d/api/webhook \
       }
     ]
   }
-}`, port, port, port)
+}
+
+The Notification hook fires both for permission requests and for plain idle
+prompts. Passing "hook_event" plus the notification "detail" lets the server
+split them into waiting:approval vs waiting:input. A hook that already knows
+which it is can instead POST "status":"waiting-approval" (or "waiting-input"),
+or set "wait_reason":"approval" alongside "status":"waiting" — both take
+precedence over the hook_event inference, and all of them override the
+pane-content heuristic while the state is fresh (%s TTL).`,
+			port, port, port, webhookTTL)
 
 		fmt.Println("=== Hook Script ===")
 		fmt.Println(hookScript)
@@ -4425,7 +4717,12 @@ curl -sX POST http://localhost:%d/api/webhook \
 		}
 		for _, agent := range agents {
 			symbol := agent.Status.Symbol()
-			fmt.Printf("%s %s %s (%s)\n", symbol, agent.Type.Badge(), agent.Name, agent.Status)
+			status := agent.Status.String()
+			if w := agent.WaitReasonOrNone(); w != WaitNone {
+				symbol = w.Symbol()
+				status += ":" + w.String()
+			}
+			fmt.Printf("%s %s %s (%s)\n", symbol, agent.Type.Badge(), agent.Name, status)
 		}
 		return
 	}

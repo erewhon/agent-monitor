@@ -32,13 +32,18 @@ Go TUI in `main.go` using the [Bubble Tea](https://github.com/charmbracelet/bubb
 - `Agent` — represents a coding agent instance (Claude Code, OpenCode, or Crush) detected in a tmux pane (session:window.pane targeting)
 - `AgentType` — enum: Claude/OpenCode/Crush/Unknown, determines which detection patterns to use
 - `Model` — Bubble Tea model holding agent list, cursor position, groups, flatAgents, and outer tmux socket reference
-- `AgentStatus` — enum: Running/Waiting/Idle/Error, detected via pattern matching on captured tmux pane content
+- `AgentStatus` — enum: Running/Planning/Waiting/Idle/Error, detected via pattern matching on captured tmux pane content
+- `WaitReason` — orthogonal refinement of `StatusWaiting`: `WaitApproval` (blocked on a tool/permission gate) vs `WaitInput` (blocked on a question). Kept separate from `AgentStatus` so the API's `status` field stays `"waiting"` and the sub-state rides along in an additive `wait_reason` field
 - `Config` / `GroupConfig` — YAML-mapped structs for agent grouping config
 - `Group` — `{Name string, Agents []Agent}` for grouped rendering
 
 **Config file:** `~/.config/agent-monitor/groups.yaml` — optional YAML file that defines named groups of agents by session name. If missing or malformed, agents display in a flat list.
 
-**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`, then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`) that match against each tool's UI patterns.
+**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`, then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`) that match against each tool's UI patterns and return a `Detection{Status, Wait, Line}`.
+
+Each detector is a thin `capturePane` + `classifyXStatus(content string) Detection` pair — the `classify*` half is pure, so pane fixtures are testable without tmux (`detection_test.go`). Approval markers are line-start-anchored via the shared `paneChrome` prefix so words like "allow" in prose or stale scrollback don't read as a permission prompt.
+
+**Waiting sub-states:** hook state posted to `POST /api/webhook` is authoritative and overrides the pane heuristic while fresh (`webhookTTL`); `WebhookState.resolvedWait()` resolves the reason from an explicit `wait_reason`, a compound `waiting-approval` status, or a `hook_event` name. Transition/debounce tracking keys on `agentState{Status, Wait}` rather than status alone, so an input→approval escalation notifies.
 
 **Nested tmux design:** The monitor runs inside an "outer" tmux session on a separate socket (`-L agent-monitor`) with prefix `C-a`, so it doesn't conflict with users' regular tmux (`C-b`). The outer session has two panes: left = TUI, right = live attach to selected agent's tmux session via `respawn-pane`.
 

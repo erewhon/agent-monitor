@@ -22,6 +22,7 @@
       --status-running: #5eff8a;
       --status-planning: #b388ff;
       --status-waiting: #ffc84d;
+      --status-approval: #ff9f45;
       --status-idle: #6d6383;
       --status-error: #ff5555;
 
@@ -130,6 +131,7 @@
     .status-glyphs .g .n { color: var(--text-dim); font-variant-numeric: tabular-nums; }
     .g-running { color: var(--status-running); }
     .g-waiting { color: var(--status-waiting); }
+    .g-approval { color: var(--status-approval); }
     .g-planning { color: var(--status-planning); }
     .g-idle { color: var(--status-idle); }
 
@@ -502,6 +504,8 @@
     .status-running { background: var(--status-running); box-shadow: 0 0 6px var(--status-running); animation: pulse 2s ease-in-out infinite; }
     .status-planning { background: var(--status-planning); box-shadow: 0 0 5px var(--status-planning); }
     .status-waiting { background: var(--status-waiting); box-shadow: 0 0 6px var(--status-waiting); animation: pulse 1.1s ease-in-out infinite; }
+    /* Approval — a blocked permission gate, pulsing faster and hotter than a plain input prompt */
+    .status-approval { background: var(--status-approval); box-shadow: 0 0 8px var(--status-approval); animation: pulse 0.8s ease-in-out infinite; }
     .status-idle { background: var(--status-idle); }
     .status-error { background: var(--status-error); box-shadow: 0 0 6px var(--status-error); animation: pulse 0.9s ease-in-out infinite; }
     .status-unknown { background: var(--status-idle); }
@@ -632,6 +636,7 @@
       opacity: 0.6;
     }
 
+    .bucket-approval { color: var(--status-approval); }
     .bucket-attention { color: var(--status-waiting); }
     .bucket-working { color: var(--status-running); }
     .bucket-idle { color: var(--text-faint); }
@@ -648,6 +653,11 @@
     .agent-item.attention {
       border-left-color: var(--status-waiting);
       background: #ffc84d0a;
+    }
+
+    .agent-item.approval {
+      border-left-color: var(--status-approval);
+      background: #ff9f4514;
     }
 
     .agent-row {
@@ -908,8 +918,9 @@
       <h1>AGENT MONITOR</h1>
     </div>
 
-    <div class="status-glyphs" id="status-glyphs" title="running · waiting · planning · idle">
+    <div class="status-glyphs" id="status-glyphs" title="running · needs approval · waiting · planning · idle">
       <span class="g g-running">● <span class="n" id="g-running">0</span></span>
+      <span class="g g-approval">◕ <span class="n" id="g-approval">0</span></span>
       <span class="g g-waiting">◐ <span class="n" id="g-waiting">0</span></span>
       <span class="g g-planning">◇ <span class="n" id="g-planning">0</span></span>
       <span class="g g-idle">○ <span class="n" id="g-idle">0</span></span>
@@ -1026,6 +1037,19 @@
       return map[badge] || 'badge-unknown';
     }
 
+    // An agent blocked on a tool/permission gate. The API reports this as
+    // status "waiting" plus wait_reason "approval", so clients that don't know
+    // about wait reasons still see it as waiting.
+    function needsApproval(a) {
+      return a && a.status === 'waiting' && a.wait_reason === 'approval';
+    }
+
+    // CSS status class for an agent dot, refining "waiting" by its reason.
+    function statusClassFor(a) {
+      if (needsApproval(a)) return 'status-approval';
+      return 'status-' + ((a && a.status) || 'unknown');
+    }
+
     // Maps a task's backend source key to a short display badge.
     function sourceBadge(source) {
       if (!source) return null;
@@ -1072,7 +1096,7 @@
         '" data-column="' + task.column + '" tabindex="0">';
       html += '<div class="card-header">';
       if (task.session_name && status) {
-        html += '<span class="status-dot status-' + escapeHtml(status) + '"></span>';
+        html += '<span class="status-dot ' + statusClassFor(agent) + '"></span>';
       }
       const src = sourceBadge(task.source);
       if (src) {
@@ -1247,14 +1271,16 @@
       $('agent-panel-count').textContent = active.length;
       $('agent-count').textContent = active.length + ' agents';
 
-      const counts = { running: 0, waiting: 0, planning: 0, idle: 0 };
+      const counts = { running: 0, approval: 0, waiting: 0, planning: 0, idle: 0 };
       active.forEach(a => {
         if (a.status === 'running') counts.running++;
+        else if (needsApproval(a)) counts.approval++;
         else if (a.status === 'waiting' || a.status === 'error') counts.waiting++;
         else if (a.status === 'planning') counts.planning++;
         else counts.idle++;
       });
       $('g-running').textContent = counts.running;
+      $('g-approval').textContent = counts.approval;
       $('g-waiting').textContent = counts.waiting;
       $('g-planning').textContent = counts.planning;
       $('g-idle').textContent = counts.idle;
@@ -1265,6 +1291,8 @@
       }
 
       const buckets = [
+        // Approval first: those agents are stalled mid-task until cleared.
+        { key: 'approval', label: 'Needs approval', cls: 'bucket-approval', match: needsApproval },
         { key: 'attention', label: 'Needs input', cls: 'bucket-attention', match: a => a.status === 'waiting' || a.status === 'error' },
         { key: 'working', label: 'Working', cls: 'bucket-working', match: a => a.status === 'running' || a.status === 'planning' },
         { key: 'idle', label: 'Idle', cls: 'bucket-idle', match: a => true },
@@ -1283,9 +1311,11 @@
           bucket.label + ' <span class="rule"></span> ' + members.length + '</div>';
 
         members.forEach(a => {
-          const statusClass = 'status-' + (a.status || 'unknown');
-          const attention = bucket.key === 'attention';
-          html += '<div class="agent-item' + (attention ? ' attention' : '') + '">';
+          const statusClass = statusClassFor(a);
+          let itemCls = '';
+          if (bucket.key === 'approval') itemCls = ' attention approval';
+          else if (bucket.key === 'attention') itemCls = ' attention';
+          html += '<div class="agent-item' + itemCls + '">';
           html += '<div class="agent-row">';
           html += '<span class="status-dot ' + statusClass + '"></span>';
           if (a.badge) {

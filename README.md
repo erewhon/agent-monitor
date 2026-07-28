@@ -4,7 +4,7 @@ A terminal UI for tracking multiple coding agents running in tmux sessions. Supp
 
 ## Features
 
-- **Real-time status tracking**: Detects if agents are running, waiting for input, or idle
+- **Real-time status tracking**: Detects if agents are running, planning, waiting, or idle — and splits waiting into *needs approval* vs *needs input*
 - **Live terminal view**: Right pane shows actual tmux session (not a snapshot)
 - **Nested tmux support**: Outer tmux uses separate socket and prefix (`C-a`) to avoid conflicts
 - **Quick navigation**: Switch between agents with j/k, focus right pane with l
@@ -59,7 +59,7 @@ This creates an outer tmux session with:
 | `k` / `↑` | Move cursor up |
 | `Enter` | Attach selected agent to right pane |
 | `l` / `→` | Focus the right pane |
-| `s` | Toggle group-by-status (bucket agents by Waiting/Error/Running/Planning/Done/Idle) |
+| `s` | Toggle group-by-status (bucket agents by Needs approval/Waiting/Error/Running/Planning/Done/Idle) |
 | `c` | Collapse / expand the group under the cursor |
 | `Space` | Toggle favorite on the selected agent |
 | `f` | Filter to favorites only |
@@ -160,9 +160,38 @@ projects:
 | Symbol | Status | Description |
 |--------|--------|-------------|
 | `⠋` (green, animated) | Running | Agent is actively working (animated Braille spinner) |
-| `◐` (yellow) | Waiting | Agent needs user input (permission prompt) |
+| `◇` (purple) | Planning | Agent is in plan mode (exploring/designing) |
+| `◕` (orange) | Waiting — approval | Agent is blocked on a tool/permission prompt |
+| `◐` (yellow) | Waiting — input | Agent is blocked on a question or free-text prompt |
 | `○` (gray) | Idle | Agent is ready for a new command |
 | `✕` (red) | Error | Agent encountered an error |
+
+### Waiting sub-states
+
+`Waiting` splits into two reasons so you can tell *why* an agent needs you.
+**Approval** is the urgent one — the agent is stalled mid-task until you clear
+the gate — so it sorts above plain input in the status lens, gets its own
+`Needs approval` bucket on the web board, and raises the ntfy priority to
+`urgent`. Notification backends see this as event `approval` rather than
+`waiting` (`AGENT_MONITOR_EVENT` for `--notify-cmd`), and an agent that
+escalates from input to approval fires a fresh notification.
+
+Two signal sources feed it:
+
+1. **Hooks (authoritative).** Anything posted to `POST /api/webhook` wins over
+   pane scraping while it's fresh. Send `"status":"waiting-approval"` (or
+   `"waiting-input"`), or `"status":"waiting"` plus either
+   `"wait_reason":"approval"` or a `"hook_event"` for the server to infer from
+   — `PreToolUse` means approval, `Notification` is split by its message text,
+   `Stop` means input. Run `agent-monitor hooks install` for a ready-made
+   Claude Code config.
+2. **Pane content (fallback).** Permission dialogs (`Do you want to proceed?`,
+   a `❯ 1. Yes` menu, `Allow`/`Deny` buttons) read as approval; a numbered menu
+   without an affirmative first option, or plain prompt chrome, reads as input.
+
+The HTTP API keeps this additive: `status` still reports `"waiting"`, with the
+sub-state in a separate `wait_reason` field (`"approval"` / `"input"`, omitted
+when unknown), so existing clients are unaffected.
 
 ## How It Works
 
