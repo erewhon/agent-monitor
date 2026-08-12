@@ -34,7 +34,8 @@ type githubSource struct {
 func newGithubSource(cfg *githubBackendCfg, group string) *githubSource {
 	owner, repo, ok := strings.Cut(cfg.Repo, "/")
 	if !ok || owner == "" || repo == "" {
-		fmt.Fprintf(os.Stderr, "agent-monitor: github backend for %q has invalid repo %q (want owner/repo)\n", group, cfg.Repo)
+		recordBackendErr("github:"+group, "config",
+			fmt.Errorf("invalid repo %q (want owner/repo)", cfg.Repo))
 		return nil
 	}
 	host := cfg.Host

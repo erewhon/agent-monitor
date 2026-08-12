@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -118,7 +119,7 @@ func loadBackendsConfig() []TaskSource {
 	if path := backendsPath(); path != "" {
 		if data, err := os.ReadFile(path); err == nil {
 			if err := yaml.Unmarshal(data, &cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "agent-monitor: backends.yaml parse error: %v\n", err)
+				recordBackendErr("backends.yaml", "config", err)
 				return nil
 			}
 		}
@@ -187,6 +188,9 @@ func loadBackendsConfig() []TaskSource {
 		if nc.APIKey == "" {
 			nc.APIKey = os.Getenv("NOUS_API_KEY")
 		}
+		if nc.APIKey == "" {
+			nc.APIKey = discoverNousAPIKey()
+		}
 		if nc.URL == "" {
 			nc.URL = "http://localhost:7667"
 		}
@@ -207,7 +211,8 @@ func loadBackendsConfig() []TaskSource {
 			pageTags:   make(map[string][]string),
 		})
 	} else if len(projectMap) > 0 {
-		fmt.Fprintln(os.Stderr, "agent-monitor: a project declares a nous backend but no global `nous:` block is configured — skipping Nous")
+		recordBackendErr("nous", "config",
+			fmt.Errorf("a project declares a nous backend but no global `nous:` block is configured"))
 	}
 
 	return sources
@@ -347,6 +352,140 @@ func (s *nousSource) Push(t SourceTask, col TaskColumn) error {
 	return nil
 }
 
+// ── Backend health & logging ─────────────────────────────────────────────
+
+// tuiActive is set once the Bubble Tea program owns the terminal. While it is
+// set, nothing may write to stderr: a stray Fprintf punches a hole through the
+// rendered frame and stays there until the next full redraw.
+var tuiActive bool
+
+// backendIssue is the current failure for one backend. Sync runs in background
+// goroutines, so failures are recorded here and surfaced by the TUI footer and
+// the log file rather than printed.
+type backendIssue struct {
+	Source string
+	Op     string // "fetch" | "push" | "config"
+	Err    string
+	Since  time.Time // first occurrence of this message
+	Count  int       // consecutive occurrences
+}
+
+var backendHealth = struct {
+	mu     sync.Mutex
+	issues map[string]backendIssue // "source|op" → latest issue
+}{issues: make(map[string]backendIssue)}
+
+// healthKey scopes an issue to one operation, so a healthy fetch doesn't clear a
+// standing push failure (writes can be rejected while reads still work).
+func healthKey(source, op string) string { return source + "|" + op }
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// recordBackendErr notes a failure. Repeats of the same message are counted but
+// only logged on first sight and every 20th repeat, so a backend that is down
+// for hours doesn't fill the log with one line per poll.
+func recordBackendErr(source, op string, err error) {
+	msg := err.Error()
+	key := healthKey(source, op)
+	backendHealth.mu.Lock()
+	prev, existed := backendHealth.issues[key]
+	issue := backendIssue{Source: source, Op: op, Err: msg, Since: time.Now(), Count: 1}
+	if existed && prev.Err == msg {
+		issue.Since = prev.Since
+		issue.Count = prev.Count + 1
+	}
+	backendHealth.issues[key] = issue
+	backendHealth.mu.Unlock()
+
+	if issue.Count == 1 || issue.Count%20 == 0 {
+		suffix := ""
+		if issue.Count > 1 {
+			suffix = fmt.Sprintf(" (×%d since %s)", issue.Count, issue.Since.Format("15:04"))
+		}
+		backendLogf("%s %s failed: %s%s", source, op, msg, suffix)
+	}
+}
+
+// clearBackendErr marks one operation on a source healthy again, logging the
+// recovery if it was previously failing.
+func clearBackendErr(source, op string) {
+	key := healthKey(source, op)
+	backendHealth.mu.Lock()
+	prev, existed := backendHealth.issues[key]
+	delete(backendHealth.issues, key)
+	backendHealth.mu.Unlock()
+	if existed {
+		backendLogf("%s %s recovered after %d failed attempt%s", source, op, prev.Count, plural(prev.Count))
+	}
+}
+
+// backendIssues returns the current failures, ordered by source then operation
+// for a stable display.
+func backendIssues() []backendIssue {
+	backendHealth.mu.Lock()
+	out := make([]backendIssue, 0, len(backendHealth.issues))
+	for _, iss := range backendHealth.issues {
+		out = append(out, iss)
+	}
+	backendHealth.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Op < out[j].Op
+	})
+	return out
+}
+
+// logFilePath is where background failures go while the TUI owns the terminal.
+func logFilePath() string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, "agent-monitor", "agent-monitor.log")
+}
+
+var logMu sync.Mutex
+
+// backendLogf appends a timestamped line to the log file. Without a TUI
+// (--web-only, --list) it also echoes to stderr, where a service manager
+// expects it.
+func backendLogf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	if !tuiActive {
+		fmt.Fprintf(os.Stderr, "agent-monitor: %s\n", line)
+	}
+	path := logFilePath()
+	if path == "" {
+		return
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	// Keep the log bounded: one rollover, no external rotation needed.
+	if fi, err := os.Stat(path); err == nil && fi.Size() > 1<<20 {
+		os.Rename(path, path+".1")
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), line)
+}
+
 // ── Generic sync loop ────────────────────────────────────────────────────
 
 // startBackendSyncLoop runs one goroutine per source, each reconciling its
@@ -389,7 +528,9 @@ func syncSourceOnce(src TaskSource, tasks *TaskStore, hub *SSEHub, prevColumns m
 		prevColumns[t.ID] = t.Column
 		if src.Writable() {
 			if err := src.Push(SourceTask{SourceID: t.SourceID, Title: t.Title, Project: t.Group}, t.Column); err != nil {
-				fmt.Fprintf(os.Stderr, "agent-monitor: %s push failed for %s: %v\n", src.Name(), t.SourceID, err)
+				recordBackendErr(src.Name(), "push", fmt.Errorf("%s: %w", t.SourceID, err))
+			} else {
+				clearBackendErr(src.Name(), "push")
 			}
 		}
 	}
@@ -397,9 +538,10 @@ func syncSourceOnce(src TaskSource, tasks *TaskStore, hub *SSEHub, prevColumns m
 	// Backend → board: pull current state and reconcile.
 	sts, err := src.Fetch()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agent-monitor: %s fetch failed: %v\n", src.Name(), err)
+		recordBackendErr(src.Name(), "fetch", err)
 		return
 	}
+	clearBackendErr(src.Name(), "fetch")
 	for _, st := range sts {
 		id, backendMovedColumn := upsertSourceTask(tasks, hub, src.Name(), st)
 		if backendMovedColumn {

@@ -147,6 +147,9 @@ projects:
   so a repo fully moved to git-bug shows only git-bug, while a mid-migration repo
   can merge Nous + GitHub. Unlisted Nous projects keep auto-appearing
   (`import_all: true`).
+- **Nous auth:** `api_key:` → `NOUS_API_KEY` → the local daemon's key file
+  (`~/.local/share/nous/daemon-api-key`, first `rw:` line), so a local Nous needs
+  no key in the config at all.
 - **GitHub auth:** per backend, `token:` → `token_cmd:` (default `gh auth token`)
   → `GITHUB_TOKEN` / `GH_TOKEN`. Enterprise via `host:`.
 - **Optional per-backend knobs:** `writable` (default true), `poll_interval`
@@ -154,6 +157,12 @@ projects:
   labels to the Active / Needs-input columns.
 - **Back-compat:** if `backends.yaml` is absent, a legacy
   `~/.config/agent-monitor/nous.yaml` is used as a single Nous backend.
+- **When a backend fails:** sync runs in the background and never prints to the
+  terminal while the TUI is up. The current failure per backend shows as an
+  orange `⚠ <source> <op>: …` line at the bottom of the agent panel, and the full
+  history goes to `~/.local/state/agent-monitor/agent-monitor.log`
+  (`$XDG_STATE_HOME` honored, one 1 MB rollover). Repeats of the same error are
+  counted, not re-logged. In `--web-only` mode the same lines go to stderr.
 
 ## Status Indicators
 
@@ -220,6 +229,7 @@ agent-monitor --no-attach
 | `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config |
 | `groups.yaml` | `~/.config/agent-monitor/` | Agent grouping config (optional) |
 | `backends.yaml` | `~/.config/agent-monitor/` | Kanban task backends: Nous / GitHub / git-bug (optional) |
+| `agent-monitor.log` | `~/.local/state/agent-monitor/` | Backend sync failures (written, not printed, while the TUI runs) |
 
 ## Requirements
 
