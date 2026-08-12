@@ -1298,7 +1298,32 @@ func loadNousConfig() *NousConfig {
 	if cfg.APIKey == "" {
 		cfg.APIKey = os.Getenv("NOUS_API_KEY")
 	}
+	if cfg.APIKey == "" {
+		cfg.APIKey = discoverNousAPIKey()
+	}
 	return &cfg
+}
+
+// discoverNousAPIKey reads the local Nous daemon's key file, the same fallback
+// the Nous MCP server uses. The daemon writes one key per line prefixed with its
+// grant ("rw:" / "ro:") and the prefix is part of the key. Without this, a
+// keyless nous.yaml against a token-requiring daemon just 401s on every poll.
+func discoverNousAPIKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".local", "share", "nous", "daemon-api-key"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "rw:") {
+			return line
+		}
+	}
+	return ""
 }
 
 // NousClient wraps the Nous HTTP API.
@@ -1337,6 +1362,91 @@ type nousEnvelope struct {
 	Error string          `json:"error"`
 }
 
+// endpoint strips the base URL so error messages stay short.
+func (c *NousClient) endpoint(url string) string {
+	return strings.TrimPrefix(url, c.baseURL)
+}
+
+// checkNousResp turns a non-2xx response or an error envelope into an error
+// carrying the server's own message. Every read path must go through this:
+// decoding a 401 body as "no data" is what made auth failures surface as the
+// misleading "notebook not found".
+func (c *NousClient) checkNousResp(url string, status int, env nousEnvelope, body []byte) error {
+	if status < 400 && env.Error == "" {
+		return nil
+	}
+	msg := env.Error
+	if msg == "" {
+		msg = strings.TrimSpace(string(body))
+	}
+	if status >= 400 {
+		if msg == "" {
+			return fmt.Errorf("%s: HTTP %d", c.endpoint(url), status)
+		}
+		return fmt.Errorf("%s: HTTP %d: %s", c.endpoint(url), status, truncate(msg, 120))
+	}
+	return fmt.Errorf("%s: %s", c.endpoint(url), truncate(msg, 120))
+}
+
+// getJSON issues an authenticated GET and unmarshals the envelope's data into
+// out (which may be nil to discard it), reporting HTTP and decode failures
+// instead of swallowing them.
+func (c *NousClient) getJSON(url string, out any) error {
+	resp, err := c.get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Error bodies are small — read them whole so the server's message survives.
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		var env nousEnvelope
+		json.Unmarshal(body, &env)
+		return c.checkNousResp(url, resp.StatusCode, env, body)
+	}
+
+	// Success bodies carry every page's full content and run to many megabytes,
+	// so stream the envelope instead of buffering the response twice.
+	var env nousEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return fmt.Errorf("%s: bad JSON: %w", c.endpoint(url), err)
+	}
+	if err := c.checkNousResp(url, resp.StatusCode, env, nil); err != nil {
+		return err
+	}
+	if out == nil || len(env.Data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(env.Data, out); err != nil {
+		return fmt.Errorf("%s: bad data: %w", c.endpoint(url), err)
+	}
+	return nil
+}
+
+// sendJSON issues an authenticated write (PUT/POST) and checks the result, so a
+// rejected board move reports why instead of silently doing nothing.
+func (c *NousClient) sendJSON(method, url string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := c.newReq(method, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var env nousEnvelope
+	json.Unmarshal(respBody, &env)
+	return c.checkNousResp(url, resp.StatusCode, env, respBody)
+}
+
 type nousNotebook struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -1363,41 +1473,27 @@ func (c *NousClient) resolveNotebookID() error {
 	if c.notebookID != "" {
 		return nil
 	}
-	resp, err := c.get(c.baseURL + "/api/notebooks")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var env nousEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return err
-	}
 	var notebooks []nousNotebook
-	json.Unmarshal(env.Data, &notebooks)
+	if err := c.getJSON(c.baseURL+"/api/notebooks", &notebooks); err != nil {
+		return err
+	}
 	for _, nb := range notebooks {
 		if nb.Name == c.notebook {
 			c.notebookID = nb.ID
 			return nil
 		}
 	}
-	return fmt.Errorf("notebook %q not found", c.notebook)
+	return fmt.Errorf("notebook %q not found (server listed %d notebooks)", c.notebook, len(notebooks))
 }
 
 func (c *NousClient) listPages() ([]nousPage, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/pages")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var env nousEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return nil, err
-	}
 	var pages []nousPage
-	json.Unmarshal(env.Data, &pages)
+	if err := c.getJSON(c.baseURL+"/api/notebooks/"+c.notebookID+"/pages", &pages); err != nil {
+		return nil, err
+	}
 	return pages, nil
 }
 
@@ -1405,18 +1501,9 @@ func (c *NousClient) updateTags(pageID string, tags []string) error {
 	if err := c.resolveNotebookID(); err != nil {
 		return err
 	}
-	body, _ := json.Marshal(map[string][]string{"tags": tags})
-	req, _ := c.newReq("PUT",
+	return c.sendJSON("PUT",
 		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/tags",
-		bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return nil
+		map[string][]string{"tags": tags})
 }
 
 // nousDatabase represents a Nous database with rows and schema.
@@ -1459,17 +1546,10 @@ func (c *NousClient) listDatabases() ([]struct{ ID, Title string }, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var env nousEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return nil, err
-	}
 	var dbs []struct{ ID, Title string }
-	json.Unmarshal(env.Data, &dbs)
+	if err := c.getJSON(c.baseURL+"/api/notebooks/"+c.notebookID+"/databases", &dbs); err != nil {
+		return nil, err
+	}
 	return dbs, nil
 }
 
@@ -1477,17 +1557,8 @@ func (c *NousClient) getDatabase(dbID string) (*nousDatabase, error) {
 	if err := c.resolveNotebookID(); err != nil {
 		return nil, err
 	}
-	resp, err := c.get(c.baseURL + "/api/notebooks/" + c.notebookID + "/databases/" + dbID)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var env nousEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return nil, err
-	}
 	var db nousDatabase
-	if err := json.Unmarshal(env.Data, &db); err != nil {
+	if err := c.getJSON(c.baseURL+"/api/notebooks/"+c.notebookID+"/databases/"+dbID, &db); err != nil {
 		return nil, err
 	}
 	return &db, nil
@@ -1582,18 +1653,9 @@ func (c *NousClient) appendToPage(pageID, content string) error {
 	if err := c.resolveNotebookID(); err != nil {
 		return err
 	}
-	body, _ := json.Marshal(map[string]string{"content": content})
-	req, _ := c.newReq("POST",
+	return c.sendJSON("POST",
 		c.baseURL+"/api/notebooks/"+c.notebookID+"/pages/"+pageID+"/append",
-		bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return nil
+		map[string]string{"content": content})
 }
 
 // inferProjectFromTags returns the most likely project name from a page's tags
@@ -2195,6 +2257,9 @@ var (
 
 	favoriteStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("220")) // yellow star
+
+	backendWarnStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("214")) // orange — degraded, not fatal
 )
 
 func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore, webhookStore *WebhookStore) Model {
@@ -3249,14 +3314,46 @@ func classifyOpenCodeStatus(content string) Detection {
 // anchored at line start so the words don't match inside response text.
 var openCodeApprovalPattern = regexp.MustCompile(`(?mi)^` + paneChrome + `[❯>›]?\s*(\d+\.\s*)?(allow|deny)\b`)
 
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes SGR sequences so captured pane text can be measured and
+// styled by us rather than carrying the agent's own colors into the panel.
+func stripANSI(s string) string { return ansiRegex.ReplaceAllString(s, "") }
+
 func truncate(s string, maxLen int) string {
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	clean := ansiRegex.ReplaceAllString(s, "")
+	clean := stripANSI(s)
 
 	if len(clean) <= maxLen {
 		return clean
 	}
 	return clean[:maxLen-3] + "..."
+}
+
+// truncateCells shortens s to at most max terminal cells, appending "…".
+// Unlike truncate() it counts display width rather than bytes, so wide runes
+// and multi-byte characters can't overflow the panel (which makes lipgloss wrap
+// the line) or get sliced mid-rune.
+func truncateCells(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	var b strings.Builder
+	width := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if width+rw > max-1 { // reserve one cell for the ellipsis
+			break
+		}
+		b.WriteRune(r)
+		width += rw
+	}
+	return b.String() + "…"
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -4183,30 +4280,92 @@ func (m Model) renderStatusSymbol(agent Agent) string {
 	}
 }
 
+// panelContentWidth is the usable text width inside the agent panel: the
+// terminal width minus the panel border (2) and its horizontal padding (2).
+// Returns 0 before the first WindowSizeMsg, meaning "width unknown — don't fit".
+func (m Model) panelContentWidth() int {
+	if m.width <= 0 {
+		return 0
+	}
+	return m.width - 4
+}
+
+// fitLine trims a plain-text line to the panel width, leaving it untouched
+// while the width is still unknown.
+func (m Model) fitLine(s string) string {
+	if avail := m.panelContentWidth(); avail > 0 {
+		return truncateCells(s, avail)
+	}
+	return s
+}
+
+// renderBackendIssues turns the backend health registry into at most two footer
+// lines. Task-sync goroutines used to print failures to stderr, which tears a
+// hole through the rendered frame; they are reported here instead, with the full
+// history in the log file.
+func (m Model) renderBackendIssues() []string {
+	issues := backendIssues()
+	if len(issues) == 0 {
+		return nil
+	}
+	const maxShown = 2
+	var lines []string
+	for i, iss := range issues {
+		if i == maxShown {
+			rest := len(issues) - maxShown
+			lines = append(lines, backendWarnStyle.Render(m.fitLine(fmt.Sprintf(
+				"⚠ +%d more backend issue%s — see %s", rest, plural(rest), logFilePath()))))
+			break
+		}
+		text := fmt.Sprintf("⚠ %s %s: %s", iss.Source, iss.Op, iss.Err)
+		if iss.Count > 1 {
+			text += fmt.Sprintf(" (×%d, %s)", iss.Count, recentIdleAge(iss.Since))
+		}
+		lines = append(lines, backendWarnStyle.Render(m.fitLine(text)))
+	}
+	return lines
+}
+
+// fitName trims an agent name so its row fits the panel. prefix and tail are the
+// already-rendered fragments on either side of the name; both may carry ANSI, so
+// widths are measured in terminal cells. Without this a long session name
+// overflows and lipgloss wraps the row, which pushes every line below it out of
+// step with its cursor index.
+func (m Model) fitName(name, prefix, tail string) string {
+	avail := m.panelContentWidth()
+	if avail == 0 {
+		return name
+	}
+	budget := avail - lipgloss.Width(prefix) - lipgloss.Width(tail)
+	if budget < 1 {
+		budget = 1
+	}
+	return truncateCells(name, budget)
+}
+
 // renderAgentLine renders an agent line with status symbol and name,
 // plus an optional second line showing last activity in dim text.
 // If displayName is non-empty, it is shown instead of agent.Name (for sub-grouped agents).
 // indent is prepended before the cursor/selection prefix (used for sub-group nesting).
-func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName string, indent string) string {
+func (m Model) renderAgentLine(agent Agent, idx int, displayName string, indent string) string {
 	// Favorite indicator (trailing)
 	favSuffix := ""
 	if m.favorites[agent.Session] {
 		favSuffix = " " + favoriteStyle.Render("★")
 	}
 
+	name := agent.Name
+	if displayName != "" {
+		name = displayName
+	}
+
 	// Phantom agents: use "·" in place of status symbol, "  " for missing badge
 	if agent.Presence == PresenceNoSession {
-		name := agent.Name
-		if displayName != "" {
-			name = displayName
-		}
+		name = m.fitName(name, indent+"  ·    ", favSuffix)
 		return phantomNoSessionStyle.Render(indent + "  ·    " + name + favSuffix)
 	}
 	if agent.Presence == PresenceNoAgent {
-		name := agent.Name
-		if displayName != "" {
-			name = displayName
-		}
+		name = m.fitName(name, indent+"  ·    ", favSuffix)
 		if idx == m.cursor {
 			return selectedStyle.Render(indent + "> ·    " + name + favSuffix)
 		}
@@ -4216,12 +4375,9 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	// Active agent rendering
 	symbol := m.renderStatusSymbol(agent)
 
-	name := agent.Name
-	if displayName != "" {
-		name = displayName
-	}
 	// Attached / grid slot indicator
 	indicator := ""
+	attachedHere := false
 	if m.gridMode {
 		slotChars := []string{"①", "②", "③", "④"}
 		for i, ga := range m.gridAgents {
@@ -4235,7 +4391,7 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 			}
 		}
 	} else if agent.Target() == m.attached {
-		name = attachedStyle.Render(name + " ◀")
+		attachedHere = true
 	}
 
 	// Add "done Xm ago" suffix for recently idle agents
@@ -4246,6 +4402,18 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 	}
 
 	badge := agent.Type.BadgeStyle().Render(agent.Type.Badge())
+
+	// Fit the raw name before styling: the attached marker and every suffix
+	// competes with it for the same row.
+	tail := indicator + suffix + favSuffix
+	if attachedHere {
+		tail += " ◀"
+	}
+	name = m.fitName(name, indent+"  "+symbol+" "+badge+" ", tail)
+	if attachedHere {
+		name = attachedStyle.Render(name + " ◀")
+	}
+
 	line := fmt.Sprintf("%s %s %s%s%s%s", symbol, badge, name, indicator, suffix, favSuffix)
 
 	if idx == m.cursor {
@@ -4256,12 +4424,16 @@ func (m Model) renderAgentLine(agent Agent, idx int, maxNameLen int, displayName
 
 	// Second line: last activity (only when toggled on)
 	if m.showActivity && agent.LastLine != "" {
-		// Truncate to fit panel width: panel border (2) + padding (2) + indent (6) + extra indent
-		maxActivity := m.width - 12 - len(indent)
+		// Fits inside the panel after the indent and the 6-column gutter that
+		// aligns activity text under the agent name.
+		maxActivity := 40
+		if avail := m.panelContentWidth(); avail > 0 {
+			maxActivity = avail - lipgloss.Width(indent) - 6
+		}
 		if maxActivity < 10 {
 			maxActivity = 10
 		}
-		activity := truncate(agent.LastLine, maxActivity)
+		activity := truncateCells(stripANSI(agent.LastLine), maxActivity)
 		line += "\n" + dimStyle.Render(indent+"      "+activity)
 	}
 
@@ -4395,16 +4567,6 @@ func (m Model) View() string {
 		return ""
 	}
 
-	// Compute max agent name length for alignment
-	maxNameLen := 0
-	for _, a := range m.flatAgents {
-		if len(a.Name) > maxNameLen {
-			maxNameLen = len(a.Name)
-		}
-	}
-	// Add space for " ◀" attached indicator
-	maxNameLen += 3
-
 	var header strings.Builder
 
 	// Gradient title
@@ -4437,6 +4599,9 @@ func (m Model) View() string {
 					chevron = "▸"
 					label = fmt.Sprintf("%s (%d)", g.Name, len(flattenItems(g.Items)))
 				}
+				if avail := m.panelContentWidth(); avail > 0 {
+					label = truncateCells(label, avail-2)
+				}
 				listLines = append(listLines, hdrStyle.Render(fmt.Sprintf("%s %s", chevron, label)))
 			}
 			if collapsed {
@@ -4446,17 +4611,21 @@ func (m Model) View() string {
 			for _, item := range g.Items {
 				if item.IsSubGroup {
 					// Sub-group header
-					listLines = append(listLines, dimStyle.Render(fmt.Sprintf("  ├ %s", item.SubGroup.Prefix)))
+					prefix := item.SubGroup.Prefix
+					if avail := m.panelContentWidth(); avail > 0 {
+						prefix = truncateCells(prefix, avail-4)
+					}
+					listLines = append(listLines, dimStyle.Render(fmt.Sprintf("  ├ %s", prefix)))
 					for _, agent := range item.SubGroup.Agents {
 						suffix := agent.Name[len(item.SubGroup.Prefix)+1:]
-						rendered := m.renderAgentLine(agent, agentIdx, maxNameLen, suffix, "  ")
+						rendered := m.renderAgentLine(agent, agentIdx, suffix, "  ")
 						for _, rl := range strings.Split(rendered, "\n") {
 							listLines = append(listLines, rl)
 						}
 						agentIdx++
 					}
 				} else {
-					rendered := m.renderAgentLine(item.Agent, agentIdx, maxNameLen, "", "")
+					rendered := m.renderAgentLine(item.Agent, agentIdx, "", "")
 					for _, rl := range strings.Split(rendered, "\n") {
 						listLines = append(listLines, rl)
 					}
@@ -4475,11 +4644,16 @@ func (m Model) View() string {
 		}
 	}
 	if m.err != nil {
-		footer.WriteString(statusError.Render(fmt.Sprintf("Error: %v", m.err)) + "\n")
+		footer.WriteString(statusError.Render(m.fitLine(fmt.Sprintf("Error: %v", m.err))) + "\n")
+	}
+	warnings := m.renderBackendIssues()
+	for _, w := range warnings {
+		footer.WriteString(w + "\n")
 	}
 
 	// Compute available height for the agent list
 	overhead := 7 // title(1) + blank(1) + borders(2) + help(3)
+	overhead += len(warnings)
 	if m.scrollOffset > 0 {
 		overhead++ // "↑ more" line
 	}
@@ -4774,6 +4948,11 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 			time.Sleep(2 * time.Second)
 		}
 	}
+
+	// From here on the TUI owns the terminal: background failures go to the log
+	// file and the footer, never to stderr. Set before config loading so a bad
+	// backends.yaml is reported the same way.
+	tuiActive = true
 
 	// Start backend sync (Nous + GitHub + git-bug) if configured
 	if sources := loadBackendsConfig(); len(sources) > 0 && taskStore != nil {
