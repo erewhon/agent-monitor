@@ -60,6 +60,7 @@ var (
 	webhookKey       *string
 	forwardURL       *string
 	forwardKey       *string
+	tokensURLFlag    *string
 )
 
 // newFlagSet declares the command-line flags on a fresh FlagSet (not the
@@ -82,6 +83,7 @@ func newFlagSet() *flag.FlagSet {
 	webhookKey = fs.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
 	forwardURL = fs.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
 	forwardKey = fs.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
+	tokensURLFlag = fs.String("tokens-url", "", "tokenator web UI base URL; the board links agents to their tokenator session (env: AGENT_MONITOR_TOKENS_URL)")
 	return fs
 }
 
@@ -642,6 +644,9 @@ type apiAgent struct {
 	Presence   string    `json:"presence"`
 	LastLine   string    `json:"last_line,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// SessionID is the harness session id (Claude Code UUID) when a hook
+	// has reported one — the key tokenator uses for the same session.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 type apiGroup struct {
@@ -655,6 +660,22 @@ type apiStatus struct {
 	UptimeSecs float64   `json:"uptime_secs"`
 	AgentCount int       `json:"agent_count"`
 	StartTime  time.Time `json:"start_time"`
+	// TokensURL is the tokenator web UI base (--tokens-url); the board links
+	// agents with a session id to <TokensURL>/session/<id>. Empty = no links.
+	TokensURL string `json:"tokens_url,omitempty"`
+}
+
+// tokensURL is the configured tokenator base, flag first then env, with any
+// trailing slash removed so the board can append paths.
+func tokensURL() string {
+	u := ""
+	if tokensURLFlag != nil {
+		u = *tokensURLFlag
+	}
+	if u == "" {
+		u = os.Getenv("AGENT_MONITOR_TOKENS_URL")
+	}
+	return strings.TrimRight(u, "/")
 }
 
 func toAPIAgent(a Agent) apiAgent {
@@ -1111,8 +1132,13 @@ type WebhookState struct {
 	// HookEvent is the Claude Code hook name that fired ("PreToolUse",
 	// "Notification", "Stop", …). Lets a hook post its raw event without
 	// having to map it to a status/reason itself.
-	HookEvent string    `json:"hook_event,omitempty"`
-	Detail    string    `json:"detail,omitempty"`
+	HookEvent string `json:"hook_event,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	// SessionID is the harness's own session id (Claude Code's session_id,
+	// the UUID that names the transcript). It is the join key to tokenator,
+	// which keys its sessions on the same UUID. Optional; hooks that read
+	// their stdin JSON can send it.
+	SessionID string    `json:"session_id,omitempty"`
 	Host      string    `json:"host,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
@@ -1162,10 +1188,13 @@ func (s WebhookState) resolvedWait() WaitReason {
 type WebhookStore struct {
 	mu     sync.RWMutex
 	states map[string]WebhookState
+	// sessionIDs outlives the state TTL: a harness session id is a fact
+	// about the tmux session until a hook reports a different one.
+	sessionIDs map[string]string
 }
 
 func newWebhookStore() *WebhookStore {
-	return &WebhookStore{states: make(map[string]WebhookState)}
+	return &WebhookStore{states: make(map[string]WebhookState), sessionIDs: make(map[string]string)}
 }
 
 const webhookTTL = 30 * time.Second
@@ -1177,6 +1206,17 @@ func (ws *WebhookStore) Set(state WebhookState) {
 		state.Timestamp = time.Now()
 	}
 	ws.states[state.Session] = state
+	if state.SessionID != "" {
+		ws.sessionIDs[state.Session] = state.SessionID
+	}
+}
+
+// SessionID returns the harness session id last reported for a tmux
+// session, or "" when no hook has sent one.
+func (ws *WebhookStore) SessionID(session string) string {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.sessionIDs[session]
 }
 
 // Get returns the webhook state for a session if it's fresh (within TTL).
@@ -1898,6 +1938,7 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 		result := make([]apiAgent, len(agents))
 		for i, a := range agents {
 			result[i] = toAPIAgent(a)
+			result[i].SessionID = webhooks.SessionID(a.Session)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
@@ -2101,6 +2142,7 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 			UptimeSecs: uptime.Seconds(),
 			AgentCount: len(agents),
 			StartTime:  state.startTime,
+			TokensURL:  tokensURL(),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
@@ -4877,9 +4919,16 @@ SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
 STATUS="${1:-running}"
 DETAIL="${2:-}"
 EVENT="${3:-}"
+# Claude Code hands every hook its event JSON on stdin; session_id in it is
+# the transcript UUID, which tokenator keys its sessions on. Optional: with
+# no jq (or no stdin) the field is simply empty.
+SESSION_ID=""
+if [ ! -t 0 ] && command -v jq >/dev/null 2>&1; then
+  SESSION_ID=$(jq -r '.session_id // empty' 2>/dev/null)
+fi
 curl -sX POST http://localhost:%d/api/webhook \
   -H 'Content-Type: application/json' \
-  -d "{\"session\":\"$SESSION\",\"agent_type\":\"claude\",\"status\":\"$STATUS\",\"detail\":\"$DETAIL\",\"hook_event\":\"$EVENT\"}" &>/dev/null &`, port)
+  -d "{\"session\":\"$SESSION\",\"agent_type\":\"claude\",\"status\":\"$STATUS\",\"detail\":\"$DETAIL\",\"hook_event\":\"$EVENT\",\"session_id\":\"$SESSION_ID\"}" &>/dev/null &`, port)
 
 		hookConfig := fmt.Sprintf(`Add to ~/.claude/settings.json under "hooks":
 
@@ -4888,19 +4937,19 @@ curl -sX POST http://localhost:%d/api/webhook \
     "PreToolUse": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"running\\\",\\\"detail\\\":\\\"$CLAUDE_TOOL\\\"}\" &>/dev/null &"
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"running\\\",\\\"detail\\\":\\\"$CLAUDE_TOOL\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
       }
     ],
     "Notification": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\",\\\"hook_event\\\":\\\"Notification\\\",\\\"detail\\\":\\\"$CLAUDE_NOTIFICATION\\\"}\" &>/dev/null &"
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\",\\\"hook_event\\\":\\\"Notification\\\",\\\"detail\\\":\\\"$CLAUDE_NOTIFICATION\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
       }
     ],
     "Stop": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"idle\\\"}\" &>/dev/null &"
+        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"idle\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
       }
     ]
   }
@@ -4912,7 +4961,11 @@ split them into waiting:approval vs waiting:input. A hook that already knows
 which it is can instead POST "status":"waiting-approval" (or "waiting-input"),
 or set "wait_reason":"approval" alongside "status":"waiting" — both take
 precedence over the hook_event inference, and all of them override the
-pane-content heuristic while the state is fresh (%s TTL).`,
+pane-content heuristic while the state is fresh (%s TTL).
+
+"session_id" is Claude Code's own session UUID, read from the hook's stdin
+JSON with jq (empty when jq is missing). It is what tokenator keys the same
+session on: with --tokens-url set, the board and /api/agents link the two.`,
 			port, port, port, webhookTTL)
 
 		fmt.Println("=== Hook Script ===")

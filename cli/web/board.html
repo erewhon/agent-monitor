@@ -909,7 +909,9 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; }
     }
-  </style>
+    .agent-link { font-size: 11px; opacity: .7; margin-left: 4px; text-decoration: none; }
+  .agent-link:hover { opacity: 1; text-decoration: underline; }
+</style>
 </head>
 <body>
   <div class="command-bar">
@@ -1013,6 +1015,7 @@
     let tasks = {};
     let agents = {};
     let availableProjects = [];
+    let tokensUrl = '';
     let currentGroupFilter = '';
     let searchQuery = '';
     let dragging = false;      // suppress re-renders mid-drag
@@ -1322,6 +1325,9 @@
             html += '<span class="badge ' + badgeClass(a.badge) + '">' + escapeHtml(a.badge) + '</span>';
           }
           html += '<span class="agent-name" title="' + escapeHtml(a.name) + '">' + escapeHtml(a.name) + '</span>';
+          if (tokensUrl && a.session_id) {
+            html += ' <a class="agent-link" href="' + escapeHtml(tokensUrl + '/session/' + encodeURIComponent(a.session_id)) + '" target="_blank" rel="noopener" title="tokenator session ' + escapeHtml(a.session_id) + '">tokens</a>';
+          }
           html += '</div>';
           if (a.last_line) {
             html += '<div class="agent-activity">' + escapeHtml(a.last_line) + '</div>';
@@ -1588,6 +1594,7 @@
       try {
         const resp = await fetch('/api/status');
         const s = await resp.json();
+        tokensUrl = s.tokens_url || '';
         $('uptime').textContent = 'up ' + s.uptime.replace(/(\.\d+)?s.*$/, 's');
       } catch { /* non-critical */ }
     }
