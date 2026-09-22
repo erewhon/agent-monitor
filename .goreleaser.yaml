@@ -2,7 +2,7 @@ version: 2
 
 builds:
   - id: agent-monitor
-    main: .
+    main: ./cmd/agent-monitor
     binary: agent-monitor
     env:
       - CGO_ENABLED=0
