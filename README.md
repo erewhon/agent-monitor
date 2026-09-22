@@ -236,3 +236,13 @@ agent-monitor --no-attach
 - Go 1.21+
 - tmux
 - One or more coding agents running in tmux sessions (Claude Code, OpenCode, or Crush)
+
+## Cross-links to tokenator
+
+Claude Code hands every hook its event JSON on stdin; the hook script and the
+settings snippets printed by `agent-monitor hooks install` read `session_id`
+from it (via `jq`) and post it with the state. That UUID is the same key
+tokenator uses for the session's transcript, so with `--tokens-url
+http://127.0.0.1:8990` (or `AGENT_MONITOR_TOKENS_URL`) the board shows a
+"tokens" link per agent and `/api/agents` carries `session_id`. `pitf session
+<id>` uses the same field to jump between the two.
