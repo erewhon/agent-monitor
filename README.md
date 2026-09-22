@@ -14,7 +14,7 @@ A terminal UI for tracking multiple coding agents running in tmux sessions. Supp
 ```bash
 # Build
 cd /path/to/agent-monitor
-go build -o agent-monitor .
+go build -o agent-monitor ./cmd/agent-monitor
 
 # Install
 cp agent-monitor ~/.local/bin/

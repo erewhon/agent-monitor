@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Run
 
 ```bash
-# Build the binary
-go build -o agent-monitor .
+# Build the binary (the module root is not a main package; the entry point is cmd/agent-monitor)
+go build -o agent-monitor ./cmd/agent-monitor
 
 # Install all components
 cp agent-monitor agent-monitor-session focus-agent-monitor ~/.local/bin/
@@ -24,13 +24,13 @@ agent-monitor --list
 
 ## Architecture
 
-Go TUI in `main.go` using the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework (Elm architecture: Model/Update/View). The Kanban task-backend layer lives in separate `package main` files: `backends.go` (the `TaskSource` interface, `backends.yaml` loader, generic sync loop, and Nous source) plus `backend_github.go` and `backend_gitbug.go`.
+Go TUI in `cli/main.go` using the [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework (Elm architecture: Model/Update/View). All of the program lives in the importable package `cli` (`github.com/erewhon/agent-monitor/cli`), which exports only `Run(ctx, args) error` (flag parsing on its own `flag.FlagSet`, then the subcommands / TUI / web-only loop) and `Version`; `cmd/agent-monitor/main.go` is a thin wrapper that stamps `cli.Version` from its ldflags `main.version`, builds a signal-cancelled context, and maps `Run`'s error to the exit code. This lets a unified CLI (pitf) mount the tool as a subcommand. The Kanban task-backend layer lives in separate `package cli` files: `cli/backends.go` (the `TaskSource` interface, `backends.yaml` loader, generic sync loop, and Nous source) plus `cli/backend_github.go` and `cli/backend_gitbug.go`. The web board template is embedded from `cli/web/board.html`.
 
 **Task backends:** The web Kanban board reads/writes a local JSON `TaskStore` (`~/.config/agent-monitor/tasks.json`), which is fed by one goroutine per configured `TaskSource` (`startBackendSyncLoop`). Each `Task` carries `Source` (unique routing key + badge), `SourceID`, and `URL`. `backends.yaml` is project-centric: a project = one swim lane declaring one or more backends (`nous` / `github` / `git-bug`); a listed project's backends are authoritative for its lane, while unlisted Nous projects auto-appear when `import_all: true`. If `backends.yaml` is absent, the legacy `nous.yaml` is used as a single Nous backend. The reconcile loop is **push-first** (board→backend before the authoritative pull) so board moves aren't reverted mid-tick. The Nous server requires a bearer token (`api_key` / `NOUS_API_KEY`, falling back to the daemon key file via `discoverNousAPIKey`).
 
 **Backend failures never touch stderr.** The TUI owns the terminal, so a stray `fmt.Fprintf(os.Stderr, …)` from a sync goroutine tears a hole through the rendered frame. Failures go to the `backendHealth` registry (`recordBackendErr` / `clearBackendErr`, keyed `source|op` so a healthy fetch doesn't clear a standing push failure) — the TUI footer renders them via `renderBackendIssues`, and `backendLogf` appends to `~/.local/state/agent-monitor/agent-monitor.log`, echoing to stderr only when `tuiActive` is false (`--web-only`, `--list`). Every Nous read goes through `NousClient.getJSON`, which checks HTTP status and the envelope's `error` field: skipping that check is what made a 401 surface as the misleading `notebook "Forge" not found`.
 
-**Panel widths.** Nothing may exceed `Model.panelContentWidth()` (terminal minus border and padding) — lipgloss wraps an over-wide row, which desyncs every line below it from its cursor index. Agent names are fitted by `fitName` (measured in terminal cells, around the already-rendered symbol/badge/suffix fragments), other lines by `fitLine`; both use `truncateCells`, the display-width-aware counterpart of the byte-based `truncate`. `render_test.go` asserts no rendered line overflows.
+**Panel widths.** Nothing may exceed `Model.panelContentWidth()` (terminal minus border and padding) — lipgloss wraps an over-wide row, which desyncs every line below it from its cursor index. Agent names are fitted by `fitName` (measured in terminal cells, around the already-rendered symbol/badge/suffix fragments), other lines by `fitLine`; both use `truncateCells`, the display-width-aware counterpart of the byte-based `truncate`. `cli/render_test.go` asserts no rendered line overflows.
 
 **Core types:**
 - `Agent` — represents a coding agent instance (Claude Code, OpenCode, or Crush) detected in a tmux pane (session:window.pane targeting)
@@ -45,7 +45,7 @@ Go TUI in `main.go` using the [Bubble Tea](https://github.com/charmbracelet/bubb
 
 **Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`, then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`) that match against each tool's UI patterns and return a `Detection{Status, Wait, Line}`.
 
-Each detector is a thin `capturePane` + `classifyXStatus(content string) Detection` pair — the `classify*` half is pure, so pane fixtures are testable without tmux (`detection_test.go`). Approval markers are line-start-anchored via the shared `paneChrome` prefix so words like "allow" in prose or stale scrollback don't read as a permission prompt.
+Each detector is a thin `capturePane` + `classifyXStatus(content string) Detection` pair — the `classify*` half is pure, so pane fixtures are testable without tmux (`cli/detection_test.go`). Approval markers are line-start-anchored via the shared `paneChrome` prefix so words like "allow" in prose or stale scrollback don't read as a permission prompt.
 
 **Waiting sub-states:** hook state posted to `POST /api/webhook` is authoritative and overrides the pane heuristic while fresh (`webhookTTL`); `WebhookState.resolvedWait()` resolves the reason from an explicit `wait_reason`, a compound `waiting-approval` status, or a `hook_event` name. Transition/debounce tracking keys on `agentState{Status, Wait}` rather than status alone, so an input→approval escalation notifies.
 

@@ -1,11 +1,13 @@
-package main
+package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -28,26 +30,60 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// version is set at build time via ldflags
-var version = "dev"
+// Version is shown in the TUI footer and the web UI. The standalone binary
+// sets it from its ldflags stamp before calling Run; embedders may set it too.
+var Version = "dev"
+
+// UsageError is returned by Run when the command line does not parse. The
+// FlagSet has already printed the error and usage to stderr, so callers
+// should print nothing more and exit with status 2 (as flag.ExitOnError
+// would). It is not returned for --help, which yields flag.ErrHelp.
+type UsageError struct{ Err error }
+
+func (e *UsageError) Error() string { return e.Err.Error() }
+
+func (e *UsageError) Unwrap() error { return e.Err }
 
 var (
-	listOnly         = flag.Bool("list", false, "List agents and exit (no TUI)")
-	outerSocket      = flag.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
-	noAttach         = flag.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
-	groupsFlag       = flag.String("groups", "", "Comma-separated list of group names to show (default: all)")
-	autoApprovePlans = flag.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
-	notifyOSC        = flag.Bool("notify", true, "Enable OSC 777 terminal notifications (passthrough to terminal emulator)")
-	ntfyTopic        = flag.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
-	ntfyServer       = flag.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
-	notifyCmd        = flag.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
-	webPort          = flag.Int("web-port", 8070, "HTTP API port")
-	noWeb            = flag.Bool("no-web", false, "Disable embedded HTTP server")
-	webOnly          = flag.Bool("web-only", false, "Run HTTP server only, no TUI")
-	webhookKey       = flag.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
-	forwardURL       = flag.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
-	forwardKey       = flag.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
+	listOnly         *bool
+	outerSocket      *string
+	noAttach         *bool
+	groupsFlag       *string
+	autoApprovePlans *bool
+	notifyOSC        *bool
+	ntfyTopic        *string
+	ntfyServer       *string
+	notifyCmd        *string
+	webPort          *int
+	noWeb            *bool
+	webOnly          *bool
+	webhookKey       *string
+	forwardURL       *string
+	forwardKey       *string
 )
+
+// newFlagSet declares the command-line flags on a fresh FlagSet (not the
+// global flag.CommandLine, so the package can be embedded in another CLI)
+// and binds the package-level flag variables to it.
+func newFlagSet() *flag.FlagSet {
+	fs := flag.NewFlagSet("agent-monitor", flag.ContinueOnError)
+	listOnly = fs.Bool("list", false, "List agents and exit (no TUI)")
+	outerSocket = fs.String("socket", "agent-monitor", "Outer tmux socket name for pane control")
+	noAttach = fs.Bool("no-attach", false, "Don't attach to agents on Enter (just list)")
+	groupsFlag = fs.String("groups", "", "Comma-separated list of group names to show (default: all)")
+	autoApprovePlans = fs.Bool("auto-approve-plans", false, "Automatically approve plan mode exits for Claude agents")
+	notifyOSC = fs.Bool("notify", true, "Enable OSC 777 terminal notifications (passthrough to terminal emulator)")
+	ntfyTopic = fs.String("ntfy-topic", "", "Enable ntfy.sh push notifications to this topic")
+	ntfyServer = fs.String("ntfy-server", "https://ntfy.sh", "ntfy server URL")
+	notifyCmd = fs.String("notify-cmd", "", "Run custom command on notification (env: AGENT_MONITOR_AGENT, _BADGE, _EVENT, _TITLE, _MESSAGE)")
+	webPort = fs.Int("web-port", 8070, "HTTP API port")
+	noWeb = fs.Bool("no-web", false, "Disable embedded HTTP server")
+	webOnly = fs.Bool("web-only", false, "Run HTTP server only, no TUI")
+	webhookKey = fs.String("webhook-key", "", "API key for authenticating remote webhooks (env: AGENT_MONITOR_WEBHOOK_KEY)")
+	forwardURL = fs.String("forward-url", "", "Forward local agent state to this remote agent-monitor URL")
+	forwardKey = fs.String("forward-key", "", "API key for the remote agent-monitor when forwarding")
+	return fs
+}
 
 // Agent type identifies which coding agent tool is running
 type AgentType string
@@ -2060,7 +2096,7 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 		agents := state.GetAgents()
 		uptime := time.Since(state.startTime)
 		result := apiStatus{
-			Version:    version,
+			Version:    Version,
 			Uptime:     uptime.Round(time.Second).String(),
 			UptimeSecs: uptime.Seconds(),
 			AgentCount: len(agents),
@@ -2093,7 +2129,7 @@ func startWebServer(port int, state *SharedState, hub *SSEHub, tasks *TaskStore,
 		boardTmpl.Execute(w, boardData{
 			AgentCount: activeCount,
 			Groups:     groupNames,
-			Version:    version,
+			Version:    Version,
 		})
 	})
 
@@ -4696,7 +4732,7 @@ func (m Model) View() string {
 	} else {
 		helpKeys = "j/k:nav  ⏎:attach  l:focus  s:status  c:fold  C:fold all  ␣:fav  f:filter  g:grid  a:activity  q:quit"
 	}
-	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(version)
+	helpText := helpStyle.Render(helpKeys) + "  " + dimStyle.Render(Version)
 	helpPanel := helpPanelStyle.Width(panelWidth).Render(helpText)
 
 	return agentPanel + "\n" + helpPanel
@@ -4761,31 +4797,40 @@ var keys = keyMap{
 	),
 }
 
-func main() {
-	flag.Parse()
+// Run parses args (the command line without the program name) and runs
+// agent-monitor exactly as the standalone binary does. A --help request
+// prints usage and returns flag.ErrHelp; callers should treat that as a
+// clean exit. Cancelling ctx stops the TUI and the --web-only loop.
+func Run(ctx context.Context, args []string) error {
+	fs := newFlagSet()
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return &UsageError{Err: err}
+	}
 
 	// Subcommand: launch <project> [--task <task>] [--feature <feature>]
-	if len(flag.Args()) >= 2 && flag.Args()[0] == "launch" {
-		projectName := flag.Args()[1]
+	if len(fs.Args()) >= 2 && fs.Args()[0] == "launch" {
+		projectName := fs.Args()[1]
 		projects := loadProjectsConfig()
 		project := projects.Find(projectName)
 		if project == nil {
-			fmt.Fprintf(os.Stderr, "Unknown project %q. Check ~/.config/agent-monitor/projects.yaml\n", projectName)
-			os.Exit(1)
+			return fmt.Errorf("unknown project %q. Check ~/.config/agent-monitor/projects.yaml", projectName)
 		}
 
 		// Parse launch-specific flags
 		var taskName, featureName string
-		for i := 2; i < len(flag.Args()); i++ {
-			switch flag.Args()[i] {
+		for i := 2; i < len(fs.Args()); i++ {
+			switch fs.Args()[i] {
 			case "--task":
-				if i+1 < len(flag.Args()) {
-					taskName = flag.Args()[i+1]
+				if i+1 < len(fs.Args()) {
+					taskName = fs.Args()[i+1]
 					i++
 				}
 			case "--feature":
-				if i+1 < len(flag.Args()) {
-					featureName = flag.Args()[i+1]
+				if i+1 < len(fs.Args()) {
+					featureName = fs.Args()[i+1]
 					i++
 				}
 			}
@@ -4799,26 +4844,25 @@ func main() {
 		}
 
 		if err := launchSession(*project, prompt); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		fmt.Printf("Launched %s in session %q\n", project.Agent, project.Name)
 		if prompt != "" {
 			fmt.Printf("Prompt: %s\n", prompt)
 		}
-		return
+		return nil
 	}
 
 	// Subcommand: webhook-key generate
-	if len(flag.Args()) >= 2 && flag.Args()[0] == "webhook-key" && flag.Args()[1] == "generate" {
+	if len(fs.Args()) >= 2 && fs.Args()[0] == "webhook-key" && fs.Args()[1] == "generate" {
 		b := make([]byte, 32)
 		rand.Read(b)
 		fmt.Println(base64.URLEncoding.EncodeToString(b))
-		return
+		return nil
 	}
 
 	// Subcommand: hooks install
-	if len(flag.Args()) >= 2 && flag.Args()[0] == "hooks" && flag.Args()[1] == "install" {
+	if len(fs.Args()) >= 2 && fs.Args()[0] == "hooks" && fs.Args()[1] == "install" {
 		port := *webPort
 		hookScript := fmt.Sprintf(`#!/bin/bash
 # agent-monitor hook — posts state changes to the webhook endpoint
@@ -4876,7 +4920,7 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 		fmt.Println()
 		fmt.Println("=== Claude Code Settings ===")
 		fmt.Println(hookConfig)
-		return
+		return nil
 	}
 
 	// List mode: just print agents and exit
@@ -4887,7 +4931,7 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 		agents := m.flatAgents
 		if len(agents) == 0 {
 			fmt.Println("No agents detected.")
-			return
+			return nil
 		}
 		for _, agent := range agents {
 			symbol := agent.Status.Symbol()
@@ -4898,7 +4942,7 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 			}
 			fmt.Printf("%s %s %s (%s)\n", symbol, agent.Type.Badge(), agent.Name, status)
 		}
-		return
+		return nil
 	}
 
 	// Start embedded HTTP server
@@ -4916,7 +4960,7 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
-		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", version, *webPort)
+		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", Version, *webPort)
 		if sources := loadBackendsConfig(); len(sources) > 0 && taskStore != nil {
 			startBackendSyncLoop(sources, taskStore, sseHub)
 		}
@@ -4945,7 +4989,11 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 					taskStore.AutoLink(disp, sseHub)
 				}
 			}
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
 		}
 	}
 
@@ -4964,16 +5012,16 @@ pane-content heuristic while the state is fresh (%s TTL).`,
 		go startForwarder(*forwardURL, *forwardKey)
 	}
 
-	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	// Kill the outer tmux session when we quit
 	if *outerSocket != "" {
 		exec.Command("tmux", "-L", *outerSocket, "kill-session").Run()
 	}
+	return nil
 }
 
 func detectAgentsSync() []Agent {
