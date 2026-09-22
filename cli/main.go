@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"golang.org/x/term"
 	"html/template"
 	"io"
 	"net"
@@ -3810,7 +3811,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					socket := m.outerSocket
 					if paneID != "" {
 						toastCmds = append(toastCmds, func() tea.Msg {
-							exec.Command("tmux", "-L", socket, "respawn-pane", "-k", "-t", paneID, "agent-monitor-placeholder").Run()
+							exec.Command("tmux", "-L", socket, "respawn-pane", "-k", "-t", paneID, selfShell("placeholder")).Run()
 							return nil
 						})
 					}
@@ -4852,6 +4853,26 @@ func Run(ctx context.Context, args []string) error {
 		return &UsageError{Err: err}
 	}
 
+	// Subcommands that run the outer tmux layout or serve it.
+	if len(fs.Args()) >= 1 {
+		switch fs.Args()[0] {
+		case "session":
+			return launchOuterSession(*outerSocket, fs.Args()[1:])
+		case "placeholder":
+			return runPlaceholder()
+		case "stats":
+			return runStats()
+		}
+	}
+
+	// Default: the full layout. A bare run on a terminal that is not already
+	// a pane of the outer tmux creates (or attaches to) the outer session and
+	// runs this TUI inside it; --no-attach, --list and --web-only keep their
+	// plain meaning. The launcher's inner invocation is detected by its pane.
+	if len(fs.Args()) == 0 && !*listOnly && !*webOnly && !*noAttach && term.IsTerminal(int(os.Stdin.Fd())) && !insideOuter(*outerSocket) {
+		return launchOuterSession(*outerSocket, args)
+	}
+
 	// Subcommand: launch <project> [--task <task>] [--feature <feature>]
 	if len(fs.Args()) >= 2 && fs.Args()[0] == "launch" {
 		projectName := fs.Args()[1]
@@ -4937,19 +4958,19 @@ curl -sX POST http://localhost:%d/api/webhook \
     "PreToolUse": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"running\\\",\\\"detail\\\":\\\"$CLAUDE_TOOL\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
+        "hooks": [{ "type": "command", "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"running\\\",\\\"detail\\\":\\\"$CLAUDE_TOOL\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &" }]
       }
     ],
     "Notification": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\",\\\"hook_event\\\":\\\"Notification\\\",\\\"detail\\\":\\\"$CLAUDE_NOTIFICATION\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
+        "hooks": [{ "type": "command", "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"waiting\\\",\\\"hook_event\\\":\\\"Notification\\\",\\\"detail\\\":\\\"$CLAUDE_NOTIFICATION\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &" }]
       }
     ],
     "Stop": [
       {
         "matcher": "",
-        "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"idle\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &"
+        "hooks": [{ "type": "command", "command": "curl -sX POST http://localhost:%d/api/webhook -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$(tmux display-message -p '#{session_name}' 2>/dev/null)\\\",\\\"agent_type\\\":\\\"claude\\\",\\\"status\\\":\\\"idle\\\",\\\"session_id\\\":\\\"$(jq -r '.session_id // empty' 2>/dev/null)\\\"}\" &>/dev/null &" }]
       }
     ]
   }
@@ -4965,7 +4986,9 @@ pane-content heuristic while the state is fresh (%s TTL).
 
 "session_id" is Claude Code's own session UUID, read from the hook's stdin
 JSON with jq (empty when jq is missing). It is what tokenator keys the same
-session on: with --tokens-url set, the board and /api/agents link the two.`,
+session on: with --tokens-url set, the board and /api/agents link the two.
+Each event's list can hold several entries, so these sit beside any hooks
+you already have (Claude Code runs every entry, each with its own stdin).`,
 			port, port, port, webhookTTL)
 
 		fmt.Println("=== Hook Script ===")

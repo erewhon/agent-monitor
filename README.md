@@ -18,20 +18,27 @@ go build -o agent-monitor ./cmd/agent-monitor
 
 # Install
 cp agent-monitor ~/.local/bin/
-cp agent-monitor-session ~/.local/bin/
-cp focus-agent-monitor ~/.local/bin/
-cp tmux-outer.conf ~/.config/agent-monitor-tmux.conf
+cp focus-agent-monitor ~/.local/bin/     # optional: inner-tmux keybinding helper
 ```
+
+The outer tmux config is built in: the first run writes it to
+`~/.config/agent-monitor-tmux.conf` (edit it there afterwards). The
+`agent-monitor-session` and `agent-monitor-placeholder` scripts are no longer
+needed; they keep working if you have them.
 
 ## Usage
 
 ### Launch the monitor session
 
 ```bash
-agent-monitor-session
+agent-monitor            # or: pitf monitor
 ```
 
-This creates an outer tmux session with:
+A bare run on a terminal creates the outer tmux session (or attaches to the
+one already running) and starts the TUI inside it; any flags are forwarded
+to the TUI. `agent-monitor session` does the same explicitly, `--no-attach`
+runs the TUI alone, and `--list` / `--web-only` are unchanged. This creates
+an outer tmux session with:
 - Left pane: agent-monitor TUI (narrow)
 - Right pane: live view of selected agent (wide)
 
@@ -217,6 +224,10 @@ agent-monitor --list
 
 # Run TUI without outer tmux integration
 agent-monitor --no-attach
+
+# Pieces the outer layout runs itself (you do not call these)
+agent-monitor placeholder   # right pane before an agent is attached
+agent-monitor stats         # status-bar load/RAM/disk segment
 ```
 
 ## Files
@@ -224,9 +235,8 @@ agent-monitor --no-attach
 | File | Location | Purpose |
 |------|----------|---------|
 | `agent-monitor` | `~/.local/bin/` | Main TUI binary |
-| `agent-monitor-session` | `~/.local/bin/` | Launcher script |
-| `focus-agent-monitor` | `~/.local/bin/` | Helper to return focus |
-| `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config |
+| `focus-agent-monitor` | `~/.local/bin/` | Helper to return focus (optional) |
+| `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config (written on first run from the embedded default) |
 | `groups.yaml` | `~/.config/agent-monitor/` | Agent grouping config (optional) |
 | `backends.yaml` | `~/.config/agent-monitor/` | Kanban task backends: Nous / GitHub / git-bug (optional) |
 | `agent-monitor.log` | `~/.local/state/agent-monitor/` | Backend sync failures (written, not printed, while the TUI runs) |
