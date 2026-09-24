@@ -26,7 +26,6 @@ archives:
       - agent-monitor-session
       - focus-agent-monitor
       - agent-monitor-placeholder
-      - tmux-outer.conf
 
 checksum:
   name_template: "checksums.txt"
@@ -55,12 +54,9 @@ brews:
       bin.install "agent-monitor-session"
       bin.install "focus-agent-monitor"
       bin.install "agent-monitor-placeholder"
-      (etc/"agent-monitor").install "tmux-outer.conf"
     caveats: |
-      The tmux config has been installed to:
-        #{etc}/agent-monitor/tmux-outer.conf
-
-      To use the session launcher, you may want to update the config path
-      in agent-monitor-session or copy it to ~/.config/agent-monitor-tmux.conf
+      Run `agent-monitor` in a terminal to open the outer tmux layout. Its
+      tmux config is built in and is written to
+      ~/.config/agent-monitor-tmux.conf on first run; edit it there.
     test: |
-      assert_match "agent-monitor", shell_output("#{bin}/agent-monitor --help 2>&1", 1)
+      assert_match "agent-monitor", shell_output("#{bin}/agent-monitor --help 2>&1")
