@@ -33,8 +33,8 @@ Go TUI in `cli/main.go` using the [Bubble Tea](https://github.com/charmbracelet/
 **Panel widths.** Nothing may exceed `Model.panelContentWidth()` (terminal minus border and padding) — lipgloss wraps an over-wide row, which desyncs every line below it from its cursor index. Agent names are fitted by `fitName` (measured in terminal cells, around the already-rendered symbol/badge/suffix fragments), other lines by `fitLine`; both use `truncateCells`, the display-width-aware counterpart of the byte-based `truncate`. `cli/render_test.go` asserts no rendered line overflows.
 
 **Core types:**
-- `Agent` — represents a coding agent instance (Claude Code, OpenCode, or Crush) detected in a tmux pane (session:window.pane targeting)
-- `AgentType` — enum: Claude/OpenCode/Crush/Unknown, determines which detection patterns to use
+- `Agent` — represents a coding agent instance (Claude Code, OpenCode, Crush, Codex, or pi) detected in a tmux pane (session:window.pane targeting)
+- `AgentType` — enum: Claude/OpenCode/Crush/Codex/Pi/Unknown, determines which detection patterns to use
 - `Model` — Bubble Tea model holding agent list, cursor position, groups, flatAgents, and outer tmux socket reference
 - `AgentStatus` — enum: Running/Planning/Waiting/Idle/Error, detected via pattern matching on captured tmux pane content
 - `WaitReason` — orthogonal refinement of `StatusWaiting`: `WaitApproval` (blocked on a tool/permission gate) vs `WaitInput` (blocked on a question). Kept separate from `AgentStatus` so the API's `status` field stays `"waiting"` and the sub-state rides along in an additive `wait_reason` field
@@ -43,9 +43,9 @@ Go TUI in `cli/main.go` using the [Bubble Tea](https://github.com/charmbracelet/
 
 **Config file:** `~/.config/agent-monitor/groups.yaml` — optional YAML file that defines named groups of agents by session name. If missing or malformed, agents display in a flat list.
 
-**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`, then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`) that match against each tool's UI patterns and return a `Detection{Status, Wait, Line}`.
+**Agent detection flow:** `detectAgents()` calls `tmux list-panes -a` on the default socket, matches pane commands against `claude`/`opencode`/`crush`/`codex` (substring) and `pi` (exact, via `isPiCommand`), then falls back to content probes (`looksLikeClaude`/`looksLikeCrush`/`looksLikeOpenCode`/`looksLikeCodex`/`looksLikePi`) for wrapped processes. `detectAgentStatus()` dispatches to type-specific detectors (`detectClaudeStatus`/`detectCrushStatus`/`detectOpenCodeStatus`/`detectCodexStatus`/`detectPiStatus`) that match against each tool's UI patterns and return a `Detection{Status, Wait, Line}`.
 
-Each detector is a thin `capturePane` + `classifyXStatus(content string) Detection` pair — the `classify*` half is pure, so pane fixtures are testable without tmux (`cli/detection_test.go`). Approval markers are line-start-anchored via the shared `paneChrome` prefix so words like "allow" in prose or stale scrollback don't read as a permission prompt.
+Each detector is a thin `capturePane` + `classifyXStatus(content string) Detection` pair — the `classify*` half is pure, so pane fixtures are testable without tmux (`cli/detection_test.go`). pi has no built-in permission gates; its only wait states are extension-raised selector/confirm/input dialogs, and its only running signal is the pi-tui Loader spinner in the editor border. Approval markers are line-start-anchored via the shared `paneChrome` prefix so words like "allow" in prose or stale scrollback don't read as a permission prompt.
 
 **Waiting sub-states:** hook state posted to `POST /api/webhook` is authoritative and overrides the pane heuristic while fresh (`webhookTTL`); `WebhookState.resolvedWait()` resolves the reason from an explicit `wait_reason`, a compound `waiting-approval` status, or a `hook_event` name. Transition/debounce tracking keys on `agentState{Status, Wait}` rather than status alone, so an input→approval escalation notifies.
 

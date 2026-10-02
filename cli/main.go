@@ -96,6 +96,7 @@ const (
 	AgentOpenCode AgentType = "opencode"
 	AgentCrush    AgentType = "crush"
 	AgentCodex    AgentType = "codex"
+	AgentPi       AgentType = "pi" // pi coding agent (@earendil-works/pi-coding-agent)
 	AgentUnknown  AgentType = "unknown"
 )
 
@@ -219,6 +220,8 @@ func (t AgentType) Badge() string {
 		return "oc"
 	case AgentCrush:
 		return "cr"
+	case AgentPi:
+		return "pi"
 	default:
 		return "??"
 	}
@@ -235,6 +238,8 @@ func (t AgentType) BadgeStyle() lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#4fc3f7")) // cyan
 	case AgentCrush:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ef5350")) // red/pink
+	case AgentPi:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb74d")) // amber
 	default:
 		return dimStyle
 	}
@@ -1308,6 +1313,8 @@ func parseWebhookAgentType(s string) AgentType {
 		return AgentCrush
 	case "codex":
 		return AgentCodex
+	case "pi":
+		return AgentPi
 	default:
 		return AgentUnknown
 	}
@@ -1765,7 +1772,7 @@ func hasTag(page nousPage, tag string) bool {
 type ProjectConfig struct {
 	Name  string `yaml:"name"`
 	Path  string `yaml:"path"`
-	Agent string `yaml:"agent"` // "claude", "opencode", "codex"
+	Agent string `yaml:"agent"` // "claude", "opencode", "codex", "crush", "pi"
 }
 
 type ProjectsConfig struct {
@@ -1822,6 +1829,10 @@ func launchSession(project ProjectConfig, taskPrompt string) error {
 		agentCmd = "opencode"
 	case "codex":
 		agentCmd = "codex"
+	case "crush":
+		agentCmd = "crush"
+	case "pi":
+		agentCmd = "pi"
 	case "claude", "":
 		agentCmd = "claude"
 	}
@@ -2765,6 +2776,8 @@ func detectAgents() tea.Msg {
 			agentType = AgentCrush
 		case strings.Contains(p.command, "codex"):
 			agentType = AgentCodex
+		case isPiCommand(p.command):
+			agentType = AgentPi
 		case versionCmd.MatchString(p.command):
 			// Claude Code sets process.title to its version number
 			agentType = AgentClaude
@@ -2797,6 +2810,8 @@ func detectAgents() tea.Msg {
 				agentType = AgentOpenCode
 			case looksLikeCodex(p.target):
 				agentType = AgentCodex
+			case looksLikePi(p.target):
+				agentType = AgentPi
 			default:
 				continue
 			}
@@ -3024,6 +3039,120 @@ func classifyCodexStatus(content string) Detection {
 // output that persists in scrollback after Codex goes idle.
 var codexApprovalPattern = regexp.MustCompile(`(?mi)^` + paneChrome + `[❯>›]?\s*(\d+\.\s*)?(Allow|Deny|Approve|Reject)\b`)
 
+// isPiCommand reports whether a pane's current command is the pi coding
+// agent. "pi" is too short for a substring match (pip, spin, api, …), so the
+// command must be exactly "pi" or a path ending in "/pi". pi runs under node
+// but sets process.title to its own name, which is what tmux reports.
+func isPiCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	return command == "pi" || strings.HasSuffix(command, "/pi")
+}
+
+// piFooterPattern matches pi's always-visible footer stats: the context
+// gauge "<pct>%/<window>k" (or "?/<window>k" before the first turn), usually
+// followed by " (auto)" when auto-compaction is on. Nothing else draws this.
+var piFooterPattern = regexp.MustCompile(`(?:\d+(?:\.\d+)?%|\?)/\d+(?:\.\d+)?[kM]\b`)
+
+// piSpinnerPattern matches pi-tui's Loader: a Braille spinner frame followed
+// by the status message ("⠋ Working", "⠙ Retrying (1/3) in 4s..."). The
+// indicator may be embedded in the editor's top border, so it is not
+// anchored at line start.
+var piSpinnerPattern = regexp.MustCompile(`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+\S`)
+
+// piSelectorHint is the key-hint row under every pi selector / confirm
+// dialog raised by an extension ("↑↓ navigate  enter select  esc cancel").
+var piSelectorHint = regexp.MustCompile(`navigate\s+\S+\s+select\s+\S+\s+cancel`)
+
+// piConfirmChoice matches the Yes/No options of ui.confirm; the arrow marks
+// the selected one.
+var piConfirmChoice = regexp.MustCompile(`(?m)^` + paneChrome + `(→\s*)?(Yes|No)\s*$`)
+
+// looksLikePi does a quick content probe to detect the pi coding agent
+// running under a wrapper, or when tmux reports node's binary name instead.
+func looksLikePi(target string) bool {
+	content, ok := capturePane(target)
+	if !ok {
+		return false
+	}
+	return hasPiMarkers(content)
+}
+
+// hasPiMarkers is the pure half of looksLikePi.
+func hasPiMarkers(content string) bool {
+	if piFooterPattern.MatchString(content) {
+		return true
+	}
+	for _, ind := range []string{
+		"escape interrupt",              // compact startup hint row
+		"ctrl+c/ctrl+d clear/exit",      // same row
+		"To resume this session: pi --", // printed on exit, still in scrollback
+		"pi --session ",
+	} {
+		if strings.Contains(content, ind) {
+			return true
+		}
+	}
+	// Startup banner: "pi v0.87.1" (or the wordmark "Pi vX" on plain terminals).
+	return regexp.MustCompile(`(?mi)^\s*pi v\d+\.\d+`).MatchString(content)
+}
+
+// detectPiStatus captures pane content and determines pi agent state.
+func detectPiStatus(target string) Detection {
+	content, ok := capturePane(target)
+	if !ok {
+		return Detection{Status: StatusError}
+	}
+	return classifyPiStatus(content)
+}
+
+// classifyPiStatus determines pi agent state from pane content.
+//
+// pi draws a fixed editor at the bottom of the pane: a box-drawn border, the
+// input line, a line with the cwd, and a footer with token stats and the
+// model id. While a turn is in flight a Loader sits in the editor border
+// ("⠋ Working", with "(escape to interrupt)" once an extension customised
+// it); retries and compaction use the same Loader with their own text. pi has
+// no built-in permission gates — tools run unprompted — so the only wait
+// states are the selector / confirm / input dialogs extensions can raise.
+func classifyPiStatus(content string) Detection {
+	lastLines := recentLines(content, 20)
+	activityLine := findActivityLine(lastLines)
+	recentContent := strings.Join(lastLines, "\n")
+
+	// Waiting: an extension dialog replaces the editor, so check it first.
+	// A Yes/No selector is an approval gate; any other selector or a text
+	// input is a question for the operator.
+	if piSelectorHint.MatchString(recentContent) {
+		if piConfirmChoice.MatchString(recentContent) {
+			return Detection{StatusWaiting, WaitApproval, truncate(activityLine, 60)}
+		}
+		return Detection{StatusWaiting, WaitInput, truncate(activityLine, 60)}
+	}
+
+	// Running: the Loader spinner, or its message text when the frame was
+	// captured mid-redraw.
+	if piSpinnerPattern.MatchString(recentContent) {
+		return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
+	}
+	for _, pat := range []string{
+		"to interrupt)", // "Working (escape to interrupt)"
+		"Retrying (",
+		"Compacting context...",
+		"Auto-compacting...",
+		"Summarizing branch...",
+	} {
+		if strings.Contains(recentContent, pat) {
+			return Detection{StatusRunning, WaitNone, truncate(activityLine, 60)}
+		}
+	}
+	// Streaming output lands above the editor; a tool call that is still
+	// executing shows its header without a result. We cannot see the
+	// difference from the footer alone, so the Loader is the only running
+	// signal and everything else is idle.
+
+	return Detection{StatusIdle, WaitNone, truncate(activityLine, 60)}
+}
+
 // detectAgentStatus dispatches to the appropriate status detector by agent type.
 func detectAgentStatus(target string, agentType AgentType) Detection {
 	switch agentType {
@@ -3033,6 +3162,8 @@ func detectAgentStatus(target string, agentType AgentType) Detection {
 		return detectOpenCodeStatus(target)
 	case AgentCodex:
 		return detectCodexStatus(target)
+	case AgentPi:
+		return detectPiStatus(target)
 	default:
 		return detectClaudeStatus(target)
 	}
@@ -3238,6 +3369,10 @@ func findActivityLine(lines []string) string {
 		"switch agent",
 		"tab agents",
 		"ctrl+p",
+		"escape interrupt", // pi startup hint row
+		"clear/exit",
+		"%/", // pi footer context gauge ("2.2%/131k (auto)")
+
 		"esc interrupt",
 		"▀▀▀▀",
 		"▣",

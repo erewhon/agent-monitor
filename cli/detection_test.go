@@ -397,3 +397,173 @@ func TestStateOfKeysTransitionsOnWaitReason(t *testing.T) {
 		t.Error("idle agents must compare equal regardless of a stale wait reason")
 	}
 }
+
+func TestIsPiCommand(t *testing.T) {
+	for cmd, want := range map[string]bool{
+		"pi":                true,
+		"/usr/local/bin/pi": true,
+		"pip":               false,
+		"spin":              false,
+		"api":               false,
+		"pi-agent":          false,
+		"node":              false,
+	} {
+		if got := isPiCommand(cmd); got != want {
+			t.Errorf("isPiCommand(%q) = %v, want %v", cmd, got, want)
+		}
+	}
+}
+
+func TestHasPiMarkers(t *testing.T) {
+	// Captured from a live pi 0.87 pane: idle editor with footer.
+	idle := pane(
+		"────────────────────────────────────────",
+		"",
+		"────────────────────────────────────────",
+		"~/code/smithy/llm-router",
+		"0.0%/131k (auto)                    auto",
+	)
+	if !hasPiMarkers(idle) {
+		t.Error("idle pi footer not recognised")
+	}
+	banner := pane(
+		" pi v0.87.1",
+		" escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more",
+	)
+	if !hasPiMarkers(banner) {
+		t.Error("pi startup banner not recognised")
+	}
+	for name, content := range map[string]string{
+		"claude": pane("● Bash(ls)", "⏵⏵ accept edits on (shift+tab to cycle)"),
+		"codex":  pane("›", "? for shortcuts   92% context left"),
+		"shell":  pane("erewhon@euclid ~ $ ls", "README.md  go.mod"),
+	} {
+		if hasPiMarkers(content) {
+			t.Errorf("%s pane misread as pi", name)
+		}
+	}
+}
+
+func TestClassifyPiStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		content    string
+		wantStatus AgentStatus
+		wantWait   WaitReason
+	}{
+		{
+			name: "idle editor with footer",
+			content: pane(
+				"Done. The router now sends the privacy header on every call.",
+				"────────────────────────────────────────",
+				"",
+				"────────────────────────────────────────",
+				"~/code/smithy/llm-router (main)",
+				"↑5.2k ↓1.3k R3.4k CH90.9% 2.2%/131k (auto)          gemma-4",
+			),
+			wantStatus: StatusIdle,
+			wantWait:   WaitNone,
+		},
+		{
+			name: "working spinner in the editor border",
+			content: pane(
+				"Let me look at the router config.",
+				"─ ⠹ Working ────────────────────────────",
+				"",
+				"────────────────────────────────────────",
+				"~/code/smithy/llm-router",
+				"↑5.2k ↓1.3k 2.2%/131k (auto)          gemma-4",
+			),
+			wantStatus: StatusRunning,
+			wantWait:   WaitNone,
+		},
+		{
+			name: "working message with interrupt hint, no spinner frame captured",
+			content: pane(
+				"Working (escape to interrupt)",
+				"────────────────────────────────────────",
+				"~/code/smithy/llm-router",
+				"2.2%/131k (auto)                    auto",
+			),
+			wantStatus: StatusRunning,
+			wantWait:   WaitNone,
+		},
+		{
+			name: "retry countdown is still running",
+			content: pane(
+				"⠧ Retrying (2/3) in 4s... (escape to cancel)",
+				"────────────────────────────────────────",
+				"2.2%/131k (auto)                    auto",
+			),
+			wantStatus: StatusRunning,
+			wantWait:   WaitNone,
+		},
+		{
+			name: "auto-compaction is running",
+			content: pane(
+				"Context overflow detected, Auto-compacting... (escape to cancel)",
+				"91.2%/131k (auto)                   auto",
+			),
+			wantStatus: StatusRunning,
+			wantWait:   WaitNone,
+		},
+		{
+			name: "extension confirm dialog is an approval gate",
+			content: pane(
+				"────────────────────────────────────────",
+				" Delete branch",
+				" Remove feature/x and its 3 commits?",
+				"",
+				" → Yes",
+				"   No",
+				"",
+				" ↑↓ navigate  enter select  esc cancel",
+				"",
+				"────────────────────────────────────────",
+			),
+			wantStatus: StatusWaiting,
+			wantWait:   WaitApproval,
+		},
+		{
+			name: "extension selector without yes/no is a question",
+			content: pane(
+				" Pick a model",
+				" → gemma-4",
+				"   glm-5.3-flash",
+				"   gpt-oss-120b",
+				"",
+				" ↑↓ navigate  enter select  esc cancel",
+			),
+			wantStatus: StatusWaiting,
+			wantWait:   WaitInput,
+		},
+		{
+			// Scrollback from a finished turn must not read as running.
+			name: "spinner glyph absent after the turn ends",
+			content: pane(
+				"bash: go test ./...",
+				"ok  	github.com/erewhon/pitf/internal/cli	0.4s",
+				"All tests pass.",
+				"────────────────────────────────────────",
+				"",
+				"────────────────────────────────────────",
+				"~/code/smithy/pitf",
+				"12.0%/131k (auto)                   auto",
+			),
+			wantStatus: StatusIdle,
+			wantWait:   WaitNone,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyPiStatus(tc.content)
+			if got.Status != tc.wantStatus {
+				t.Errorf("status = %v, want %v", got.Status, tc.wantStatus)
+			}
+			if got.Wait != tc.wantWait {
+				t.Errorf("wait = %q, want %q", got.Wait, tc.wantWait)
+			}
+		})
+	}
+}
