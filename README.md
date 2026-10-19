@@ -171,6 +171,48 @@ projects:
   (`$XDG_STATE_HOME` honored, one 1 MB rollover). Repeats of the same error are
   counted, not re-logged. In `--web-only` mode the same lines go to stderr.
 
+## Wardens (contract-work VMs)
+
+A VM watched through the [warden](https://code.bcc.sh/smithy/warden) gate can sit in the
+sidebar as a row of its own. agent-monitor only ever sends the verb `status` over the
+forced-command key and only ever receives the Status document (numbers, enums, timestamps,
+the VM label), so the row shows liveness, state and counters and nothing from inside the box.
+
+`~/.config/agent-monitor/wardens.yaml`:
+
+```yaml
+wardens:
+  - label: work-cfa                 # the VM's own label (must match what it reports)
+    host: work-cfa.m.bcc.sh
+    key: ~/.ssh/warden-work-cfa
+    attach: ssh -t work-cfa.m.bcc.sh tmux new -A -s main   # optional; runs in the content pane
+  - label: work-da
+    host: 10.0.0.9
+    user: warden                    # default
+    port: 22                        # default
+    poll_s: 30                      # default
+    stale_min: 10                   # heartbeat older than this reads as error
+    notify_ntfy: false              # default; the warden coordinator already pages over Signal
+```
+
+How the document maps onto a row (badge `wd`):
+
+| Document | Row |
+|---|---|
+| `current.state: running` | running |
+| `blocked` with `NEEDS_HUMAN` | waiting: approval (top of the status lens, toast + desktop notification) |
+| `blocked` with `TESTS_FAILING` | waiting: input |
+| `idle`, `done`, no current task, or `paused` | idle |
+| heartbeat older than `stale_min`, ssh failure, unparsable document | error |
+
+The activity line (`a`) reads `commits 6 · hb 40s · OK · q 0 · t 40/0`; a `?` is a field the
+VM does not reveal. Rows that no group in `groups.yaml` claims sit together under **Wardens**.
+
+Selecting a warden runs its `attach` command in the content pane. Without one, the pane shows a
+read-only panel (`agent-monitor warden-status <label>`): the document, when it was polled, and
+what the paging coordinator in `meta` last did about this VM (`~/.local/share/work-watcher/state.json`).
+A warden row never gets "finished" or "planning" notifications; only its waiting transitions ping.
+
 ## Status Indicators
 
 | Symbol | Status | Description |
@@ -239,6 +281,7 @@ agent-monitor stats         # status-bar load/RAM/disk segment
 | `agent-monitor-tmux.conf` | `~/.config/` | Outer tmux config (written on first run from the embedded default) |
 | `groups.yaml` | `~/.config/agent-monitor/` | Agent grouping config (optional) |
 | `backends.yaml` | `~/.config/agent-monitor/` | Kanban task backends: Nous / GitHub / git-bug (optional) |
+| `wardens.yaml` | `~/.config/agent-monitor/` | Warden-watched contract VMs as sidebar rows (optional) |
 | `agent-monitor.log` | `~/.local/state/agent-monitor/` | Backend sync failures (written, not printed, while the TUI runs) |
 
 ## Requirements

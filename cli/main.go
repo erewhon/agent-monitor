@@ -222,6 +222,8 @@ func (t AgentType) Badge() string {
 		return "cr"
 	case AgentPi:
 		return "pi"
+	case AgentWarden:
+		return "wd"
 	default:
 		return "??"
 	}
@@ -240,6 +242,8 @@ func (t AgentType) BadgeStyle() lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ef5350")) // red/pink
 	case AgentPi:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb74d")) // amber
+	case AgentWarden:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#80cbc4")) // teal: a watched box, not an agent here
 	default:
 		return dimStyle
 	}
@@ -257,6 +261,12 @@ type Agent struct {
 	Presence  AgentPresence // Active, NoAgent (session exists), or NoSession
 	LastLine  string        // Last line of output (for status detection)
 	UpdatedAt time.Time
+	// Host is set for rows that live on another machine (webhook-pushed
+	// remote agents, warden-watched VMs). Attach is the shell command the
+	// content pane runs when the row is selected; empty means the local
+	// tmux attach (or, for a warden, the read-only status panel).
+	Host   string
+	Attach string
 }
 
 // WaitReasonOrNone returns the wait reason only when the agent is actually
@@ -472,6 +482,9 @@ type Notification struct {
 	Badge     string
 	Event     NotifyEvent
 	Message   string
+	// SkipNtfy keeps this one off the push channel (warden rows by default:
+	// the warden coordinator already pages over Signal).
+	SkipNtfy bool
 }
 
 func (n Notification) Title() string {
@@ -590,7 +603,7 @@ func dispatchNotification(n Notification, outerSocket string) []tea.Cmd {
 	if *notifyOSC {
 		cmds = append(cmds, sendOSCNotification(n, outerSocket))
 	}
-	if *ntfyTopic != "" {
+	if *ntfyTopic != "" && !n.SkipNtfy {
 		cmds = append(cmds, sendNtfyNotification(n, *ntfyServer, *ntfyTopic))
 	}
 	if *notifyCmd != "" {
@@ -653,6 +666,9 @@ type apiAgent struct {
 	// SessionID is the harness session id (Claude Code UUID) when a hook
 	// has reported one — the key tokenator uses for the same session.
 	SessionID string `json:"session_id,omitempty"`
+	// Host is set for rows on another machine (remote webhook agents,
+	// warden-watched VMs).
+	Host string `json:"host,omitempty"`
 }
 
 type apiGroup struct {
@@ -705,6 +721,7 @@ func toAPIAgent(a Agent) apiAgent {
 		Presence:   presence,
 		LastLine:   a.LastLine,
 		UpdatedAt:  a.UpdatedAt,
+		Host:       a.Host,
 	}
 }
 
@@ -1144,8 +1161,12 @@ type WebhookState struct {
 	// the UUID that names the transcript). It is the join key to tokenator,
 	// which keys its sessions on the same UUID. Optional; hooks that read
 	// their stdin JSON can send it.
-	SessionID string    `json:"session_id,omitempty"`
-	Host      string    `json:"host,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	Host      string `json:"host,omitempty"`
+	// Attach is the shell command the content pane runs when this remote
+	// row is selected (e.g. an ssh into the host). Without it a remote row
+	// cannot be attached to: there is no local tmux session behind it.
+	Attach    string    `json:"attach,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -1254,6 +1275,8 @@ func (ws *WebhookStore) GetRemoteAgents() []Agent {
 			Presence:  PresenceActive,
 			LastLine:  state.Detail,
 			UpdatedAt: state.Timestamp,
+			Host:      state.Host,
+			Attach:    state.Attach,
 		})
 	}
 	return agents
@@ -2252,6 +2275,7 @@ type Model struct {
 	sseHub              *SSEHub               // SSE event hub (nil if --no-web)
 	taskStore           *TaskStore            // persistent task storage (nil if --no-web)
 	webhookStore        *WebhookStore         // push-based agent state (nil if --no-web)
+	wardenStore         *WardenStore          // warden-watched VMs (nil if no wardens.yaml)
 }
 
 // Messages
@@ -2352,7 +2376,7 @@ var (
 				Foreground(lipgloss.Color("214")) // orange — degraded, not fatal
 )
 
-func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore, webhookStore *WebhookStore) Model {
+func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore, webhookStore *WebhookStore, wardenStore *WardenStore) Model {
 	m := Model{
 		agents:              []Agent{},
 		cursor:              0,
@@ -2368,6 +2392,7 @@ func initialModel(sharedState *SharedState, sseHub *SSEHub, taskStore *TaskStore
 		sseHub:              sseHub,
 		taskStore:           taskStore,
 		webhookStore:        webhookStore,
+		wardenStore:         wardenStore,
 	}
 	if *groupsFlag != "" {
 		m.filterGroups = make(map[string]bool)
@@ -2518,6 +2543,17 @@ func (m *Model) buildGroups() {
 			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
 		}
 	}
+	// Wardens that no config group claims sit together, above Other.
+	var wardens []Agent
+	other = splitWardens(other, &wardens)
+	if len(wardens) > 0 && (m.filterGroups == nil || m.filterGroups[wardensGroup]) {
+		items := computeItems(wardens)
+		g := Group{Name: wardensGroup, Items: items}
+		m.groups = append(m.groups, g)
+		if !m.isCollapsed(g.Name) {
+			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
+		}
+	}
 	if len(other) > 0 && m.filterGroups == nil {
 		items := computeItems(other)
 		g := Group{Name: "Other", Items: items}
@@ -2526,6 +2562,23 @@ func (m *Model) buildGroups() {
 			m.flatAgents = append(m.flatAgents, flattenItems(items)...)
 		}
 	}
+}
+
+// wardensGroup is the default group for warden rows that groups.yaml does
+// not place elsewhere.
+const wardensGroup = "Wardens"
+
+// splitWardens moves warden rows out of agents into *wardens.
+func splitWardens(agents []Agent, wardens *[]Agent) []Agent {
+	rest := agents[:0:0]
+	for _, a := range agents {
+		if a.Type == AgentWarden {
+			*wardens = append(*wardens, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	return rest
 }
 
 // statusBucket describes one status category for group-by-status mode.
@@ -3809,6 +3862,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.webhookStore != nil {
 			m.agents = append(m.agents, m.webhookStore.GetRemoteAgents()...)
 		}
+		// Inject warden-watched VMs
+		m.agents = append(m.agents, m.wardenStore.Agents(time.Now())...)
 		// Detect transitions with debouncing: a status change must persist
 		// for 2 consecutive polls before triggering notifications. This
 		// prevents spurious alerts when detection briefly flickers (e.g.
@@ -3864,7 +3919,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						Badge:     a.Type.Badge(),
 						Event:     notifyEventForWait(cur.Wait),
 						Message:   a.LastLine,
+						SkipNtfy:  a.Type == AgentWarden && !m.wardenStore.NtfyEnabled(a.Session),
 					}, m.outerSocket)...)
+				}
+				// A warden row has no plan mode and goes idle whenever the
+				// VM is quiet: only its waiting transitions are worth a ping.
+				if a.Type == AgentWarden {
+					continue
 				}
 				// Planning transition
 				if prev.Status != StatusPlanning && cur.Status == StatusPlanning {
@@ -4227,15 +4288,11 @@ func (m Model) attachToAgent(agent Agent) tea.Cmd {
 	return func() tea.Msg {
 		target := agent.Target()
 
-		// For phantom sessions (no agent), attach to the session itself
-		attachTarget := target
-		if agent.Presence == PresenceNoAgent {
-			attachTarget = agent.Session
-		}
-
-		// Use respawn-pane to kill whatever is running and start fresh with the attach command
-		// This cleanly handles: placeholder, attached tmux session, or anything else
-		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", attachTarget)
+		// Use respawn-pane to kill whatever is running and start fresh with the
+		// row's attach command (local tmux attach, the row's own command, or
+		// the warden status panel). This cleanly handles: placeholder,
+		// attached tmux session, or anything else.
+		attachCmd := attachCommand(agent)
 		exec.Command("tmux", "-L", m.outerSocket, "respawn-pane", "-k", "-t", "0.1", attachCmd).Run()
 
 		// Focus the right pane
@@ -4384,11 +4441,7 @@ func (m Model) gridAttach(slot int, agent Agent) tea.Cmd {
 			return nil
 		}
 		target := agent.Target()
-		attachTarget := target
-		if agent.Presence == PresenceNoAgent {
-			attachTarget = agent.Session
-		}
-		attachCmd := fmt.Sprintf("unset TMUX; exec tmux attach-session -t '%s'", attachTarget)
+		attachCmd := attachCommand(agent)
 		exec.Command("tmux", "-L", m.outerSocket, "respawn-pane", "-k", "-t", paneID, attachCmd).Run()
 		return gridAttachResultMsg{slot: slot, target: target}
 	}
@@ -4997,6 +5050,12 @@ func Run(ctx context.Context, args []string) error {
 			return runPlaceholder()
 		case "stats":
 			return runStats()
+		case "warden-status":
+			if len(fs.Args()) < 2 {
+				return &UsageError{Err: errors.New("usage: agent-monitor warden-status <label> [--once]")}
+			}
+			once := len(fs.Args()) >= 3 && fs.Args()[2] == "--once"
+			return runWardenStatus(ctx, fs.Args()[1], once)
 		}
 	}
 
@@ -5136,8 +5195,10 @@ you already have (Claude Code runs every entry, each with its own stdin).`,
 
 	// List mode: just print agents and exit
 	if *listOnly {
-		m := initialModel(nil, nil, nil, nil)
-		m.agents = detectAgentsSync()
+		wardenStore := newWardenStore(loadWardensConfig())
+		wardenStore.PollOnce(ctx)
+		m := initialModel(nil, nil, nil, nil, wardenStore)
+		m.agents = append(detectAgentsSync(), wardenStore.Agents(time.Now())...)
 		m.buildGroups()
 		agents := m.flatAgents
 		if len(agents) == 0 {
@@ -5169,19 +5230,28 @@ you already have (Claude Code runs every entry, each with its own stdin).`,
 		go startWebServer(*webPort, sharedState, sseHub, taskStore, webhookStore)
 	}
 
+	// Warden-watched VMs: one poller per entry of wardens.yaml, rows merged
+	// into every agent update. nil-safe when nothing is configured.
+	var wardenStore *WardenStore
+	if cfgs := loadWardensConfig(); len(cfgs) > 0 {
+		wardenStore = newWardenStore(cfgs)
+		wardenStore.Start(ctx)
+	}
+
 	// Web-only mode: run HTTP server with a polling loop, no TUI
 	if *webOnly {
 		fmt.Fprintf(os.Stderr, "agent-monitor %s — HTTP API on :%d\n", Version, *webPort)
 		if sources := loadBackendsConfig(); len(sources) > 0 && taskStore != nil {
 			startBackendSyncLoop(sources, taskStore, sseHub)
 		}
-		m := initialModel(sharedState, sseHub, taskStore, webhookStore)
+		m := initialModel(sharedState, sseHub, taskStore, webhookStore, wardenStore)
 		for {
 			m.agents = detectAgentsSync()
 			mergeWebhookState(m.agents, webhookStore)
 			if webhookStore != nil {
 				m.agents = append(m.agents, webhookStore.GetRemoteAgents()...)
 			}
+			m.agents = append(m.agents, wardenStore.Agents(time.Now())...)
 			if len(m.config.Groups) > 0 {
 				m.agents = append(m.agents, detectPhantomSessions(m.config, m.agents)...)
 			}
@@ -5223,7 +5293,7 @@ you already have (Claude Code runs every entry, each with its own stdin).`,
 		go startForwarder(*forwardURL, *forwardKey)
 	}
 
-	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
+	p := tea.NewProgram(initialModel(sharedState, sseHub, taskStore, webhookStore, wardenStore), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
 	if _, err := p.Run(); err != nil {
 		return err
 	}
