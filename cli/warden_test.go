@@ -236,4 +236,12 @@ func TestWardenPanelShowsOnlyDocumentFields(t *testing.T) {
 			t.Errorf("panel lacks %q:\n%s", want, out)
 		}
 	}
+	d.Current.State = "blocked"
+	d.ReasonCode = "NEEDS_HUMAN"
+	out = renderWardenPanel(sample(d, nil), nil, wardenNow)
+	for _, want := range []string{"◕ waiting:approval", "reason     NEEDS_HUMAN"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("panel lacks %q:\n%s", want, out)
+		}
+	}
 }

@@ -472,10 +472,12 @@ func renderWardenPanel(s wardenSample, co *coordinatorState, now time.Time) stri
 	row := wardenRow(s, now)
 	fmt.Fprintf(&b, "warden %s  (%s)\n", s.cfg.Label, s.cfg.Host)
 	status := row.Status.String()
+	symbol := row.Status.Symbol()
 	if w := row.WaitReasonOrNone(); w != WaitNone {
 		status += ":" + w.String()
+		symbol = w.Symbol()
 	}
-	fmt.Fprintf(&b, "  state      %s %s\n", row.Status.Symbol(), status)
+	fmt.Fprintf(&b, "  state      %s %s\n", symbol, status)
 	if s.at.IsZero() {
 		b.WriteString("  polled     never\n")
 	} else {
