@@ -14,9 +14,10 @@ builds:
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: darwin
-        goarch: amd64
+    # darwin/amd64 is built on purpose even if nobody runs it: without it the
+    # generated formula has no URL on Intel macOS, and Homebrew then rejects
+    # the WHOLE smithy tap on every platform ("Cannot tap smithy/tap: invalid
+    # syntax in tap!"), which broke the dotfiles bootstrap on new Linux boxes.
 
 archives:
   - id: agent-monitor
